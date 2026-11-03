@@ -1,0 +1,1836 @@
+--[[
+	ADVANCED PATHFINDER v1
+	Created by Spvico
+
+	Custom A* pathfinder (NO PathfindingService) with physics-aware obby jumping.
+	Run as a LocalScript (StarterPlayerScripts) or paste into an executor.
+
+	Button  : quick tap = ON/OFF, hold > 1s = drag mode (move it, release to drop).
+	When ON : tap the world -> slope check (<= 80 deg) -> path -> walk / jump there.
+	Moving the joystick or WASD cancels the current route.
+
+	Jump model (per jump edge):
+	  - takeoff point = real edge of the current part, landing point = inset point on the
+	    target part (center for small parts, so 1x1 studs works)
+	  - flight time solved from JumpPower/JumpHeight + gravity, reach = WalkSpeed * time
+	  - run-up never stops: Move() stays active, jump is fired while still running
+	  - in the air, throttle is recomputed EVERY FRAME from (distance left / time left)
+	    so you touch down exactly on the landing point without braking before the jump
+]]
+
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local Workspace        = game:GetService("Workspace")
+local CollectionService = game:GetService("CollectionService")
+
+local player = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+if env.__AdvancedPathfinder then pcall(env.__AdvancedPathfinder) end
+
+local CONFIG = {
+	HoldTime        = 1.0,   -- hold longer than this on the button = drag mode
+	TapTime         = 0.35,  -- world tap max duration
+	TapMove         = 14,    -- world tap max finger travel (px), filters camera drags
+	MaxSlopeDeg     = 80,    -- max clickable / walkable surface angle
+
+	Cell            = 2,     -- walk lattice spacing (studs)
+	StepUp          = 1.5,   -- max stair height walked without jumping
+	MaxFall         = math.huge, -- optional cap on drop depth (e.g. 80 if the game has fall damage).
+	                             -- default: depth is limited only by physics reach + the void kill height
+	MaxQueryRadius  = 150,   -- performance cap on how far we scan for landing parts (not a feasibility limit)
+	MaxFallExpansions = 400, -- how many ledge nodes may sample the ground below for falls
+	AgentRadius     = 0.9,
+	HeuristicWeight = 1.25,  -- >1 = faster search, slightly less optimal
+	MaxNodes        = 5000,
+	TimeSlice       = 0.006, -- seconds of search work per frame
+	GoalTolerance   = 1.6,
+	MaxReplans      = 4,
+
+	JumpPenalty       = 3,
+	MaxJumpCandidates = 8,   -- landing parts evaluated per ledge node
+	MaxJumpExpansions = 800,
+	LandMargin        = 1.2, -- landing point is pulled this far inside the part edge
+	EdgeScan          = 5,   -- how far from a node we look for the takeoff edge
+	TakeoffInset      = 0.3,
+	ReachSafety       = 0.93,
+	HeightSafety      = 0.97,
+	VelocityAssist    = false, -- true = also force air velocity (use if Move() throttle is ignored)
+	ShowPath          = true,
+	BacktrackTol      = 3,    -- unreachable goal: never route more than this far AWAY from the goal
+	ClimbEnabled      = true, -- truss / ladder climbing
+	MaxClimbChecks    = 1500,
+	FallbackPathWeight = 0.1, -- unreachable goal: prefer closer points that are also cheap to reach
+
+	RetryInterval     = 1.5,  -- at the closest point, retry the real target this often
+	RetryAttempts     = 8,
+	OffRoute          = 4,    -- studs away from the planned segment before re-planning (conveyor, knockback)
+	MaxReroutes       = 12,
+	HoldSeconds       = 3,    -- after arriving, correct drift for this long
+	HoldDrift         = 2.5,
+
+	AvoidHazards      = true,  -- kill bricks / lava / damage zones
+	HazardThreshold   = 2.5,   -- hazard score needed to treat a part as deadly
+	LearnHazards      = true,  -- learn kill bricks from your deaths / damage
+	AllowHazardGoal   = false, -- allow tapping directly on a hazard
+
+	IceSupport        = true,  -- ice-aware movement (learned traction, pursuit steering, braking plan)
+	SlipperyFriction  = 0.12,  -- friction below this = ice (Ice 0.02, Glacier 0.05, or custom)
+	SlipPenalty       = 0,     -- optional extra path cost on ice (0 = ice is treated like normal ground)
+	SlipEdgePenalty   = 0,     -- optional extra cost per open side near ice edges (0 = off)
+	SlipEdgeMargin    = 1.6,   -- distance used by SlipEdgePenalty
+	ForbidSlippery    = false, -- true = never use ice at all (off by default)
+
+	VaultEnabled      = true,  -- jump over walls to the ground on the far side
+	MaxWallThickness  = 14,    -- how thick a wall we will try to clear
+	MaxVaultExpansions = 600,
+}
+
+---------------------------------------------------------------- constants / helpers
+local V3 = Vector3.new
+local COS_SLOPE = math.cos(math.rad(CONFIG.MaxSlopeDeg))
+local COS_LAND  = 0.75
+local MID_H, HEAD_H = 2.6, 4.6
+local RADIUS = CONFIG.AgentRadius
+local CELL   = CONFIG.Cell
+local OFFSETS = { {1,0},{-1,0},{0,1},{0,-1},{1,1},{1,-1},{-1,1},{-1,-1} }
+
+local WHITE  = Color3.new(1, 1, 1)
+local GREEN  = Color3.fromRGB(70, 220, 120)
+local RED    = Color3.fromRGB(255, 90, 90)
+local ORANGE = Color3.fromRGB(255, 170, 60)
+local YELLOW = Color3.fromRGB(255, 225, 70)
+
+local connections = {}
+local function connect(sig, fn)
+	local c = sig:Connect(fn)
+	connections[#connections + 1] = c
+	return c
+end
+
+local function flat(v) return V3(v.X, 0, v.Z) end
+local function flatDist(a, b)
+	local dx, dz = a.X - b.X, a.Z - b.Z
+	return math.sqrt(dx * dx + dz * dz)
+end
+
+-- search heuristic: going down is nearly free (falling), going up costs full height
+local function heur(p, g)
+	local dx, dz = p.X - g.X, p.Z - g.Z
+	local dy = g.Y - p.Y
+	return math.sqrt(dx * dx + dz * dz) + (dy > 0 and dy or -dy * 0.05)
+end
+
+---------------------------------------------------------------- state
+local active = false
+local follow = nil
+local searchId = 0
+local currentToken = 0
+local goalPos = Vector3.zero
+local sliceStart = 0
+local rootHCache = nil
+local jumpExpansions = 0
+local retryId, searchingId = 0, 0
+local fallExpansions = 0
+local brakeUntil = 0
+local vaultExpansions = 0
+local S = { g = 196.2, vy = 50, vyReal = 50, speed = 16, rootH = 3, maxH = 6.4, iceAccel = 10 }
+local CANCEL = {}
+
+---------------------------------------------------------------- GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "AdvancedPathfinder"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 1000
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+do
+	local ok = pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+	if not ok or not gui.Parent then gui.Parent = player:WaitForChild("PlayerGui") end
+end
+
+local OFF_COLOR  = Color3.fromRGB(35, 35, 42)
+local ON_COLOR   = Color3.fromRGB(40, 200, 110)
+local DRAG_COLOR = Color3.fromRGB(255, 190, 40)
+
+local button = Instance.new("TextButton")
+button.Name = "Toggle"
+button.AnchorPoint = Vector2.new(0.5, 0.5)
+button.Size = UDim2.fromOffset(60, 60)
+button.Position = UDim2.new(1, -60, 0.55, 0)
+button.BackgroundColor3 = OFF_COLOR
+button.AutoButtonColor = false
+button.Text = "AP"
+button.TextColor3 = WHITE
+button.TextSize = 22
+button.Font = Enum.Font.GothamBold
+button.Parent = gui
+do
+	local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(1, 0); c.Parent = button
+	local s = Instance.new("UIStroke"); s.Thickness = 2; s.Color = Color3.fromRGB(230, 230, 235); s.Parent = button
+end
+
+local toast = Instance.new("TextLabel")
+toast.AnchorPoint = Vector2.new(0.5, 0)
+toast.Position = UDim2.new(0.5, 0, 0, 64)
+toast.Size = UDim2.fromOffset(300, 34)
+toast.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+toast.BackgroundTransparency = 0.25
+toast.Font = Enum.Font.GothamMedium
+toast.TextSize = 16
+toast.TextColor3 = WHITE
+toast.Visible = false
+toast.Parent = gui
+do local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 10); c.Parent = toast end
+
+local toastId = 0
+local function notify(text, color)
+	toastId += 1
+	local my = toastId
+	toast.Text = text
+	toast.TextColor3 = color or WHITE
+	toast.Visible = true
+	task.delay(2.4, function() if my == toastId then toast.Visible = false end end)
+end
+
+local visuals = Instance.new("Folder")
+visuals.Name = "AP_Visuals"
+visuals.Parent = Workspace.Terrain
+
+local function marker(pos, color, size)
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Ball
+	p.Size = V3(size, size, size)
+	p.Anchored = true
+	p.CanCollide, p.CanQuery, p.CanTouch, p.CastShadow = false, false, false, false
+	p.Material = Enum.Material.Neon
+	p.Color = color
+	p.Transparency = 0.25
+	p.Position = pos + V3(0, 0.3, 0)
+	p.Parent = visuals
+end
+
+---------------------------------------------------------------- world queries
+local worldParams = RaycastParams.new()
+worldParams.FilterType = Enum.RaycastFilterType.Exclude
+worldParams.IgnoreWater = true
+worldParams.RespectCanCollide = true
+
+local overlapParams = OverlapParams.new()
+overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+overlapParams.RespectCanCollide = true
+overlapParams.MaxParts = 400
+
+local hazardOverlap = OverlapParams.new() -- also sees non-collidable parts (kill zones, lasers)
+hazardOverlap.FilterType = Enum.RaycastFilterType.Exclude
+hazardOverlap.RespectCanCollide = false
+hazardOverlap.MaxParts = 60
+
+local function refreshFilter()
+	local list = { visuals }
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.Character then list[#list + 1] = p.Character end
+	end
+	worldParams.FilterDescendantsInstances = list
+	overlapParams.FilterDescendantsInstances = list
+	hazardOverlap.FilterDescendantsInstances = list
+end
+
+local function raycast(o, d) return Workspace:Raycast(o, d, worldParams) end
+
+local HAS_SPHERE = pcall(function() return Workspace.Spherecast end)
+local function sweep(o, d, radius)
+	if HAS_SPHERE then return Workspace:Spherecast(o, radius, d, worldParams) end
+	return Workspace:Raycast(o, d, worldParams)
+end
+
+local function getChar()
+	local c = player.Character
+	if not c then return end
+	local hum = c:FindFirstChildOfClass("Humanoid")
+	local root = hum and hum.RootPart or c:FindFirstChild("HumanoidRootPart")
+	if hum and root and hum.Health > 0 then return c, hum, root end
+end
+
+local function measureRootH(hum, root)
+	if hum.FloorMaterial ~= Enum.Material.Air then
+		local r = raycast(root.Position, V3(0, -10, 0))
+		if r and r.Normal.Y > 0.97 then
+			local d = root.Position.Y - r.Position.Y
+			if d > 1 and d < 8 then rootHCache = d end
+		end
+	end
+	if not rootHCache then
+		rootHCache = root.Size.Y / 2 + hum.HipHeight + (hum.RigType == Enum.HumanoidRigType.R6 and 2 or 0)
+	end
+	return rootHCache
+end
+
+local function readStats(hum, root)
+	local g = Workspace.Gravity
+	local vy = hum.UseJumpPower and hum.JumpPower or math.sqrt(2 * g * hum.JumpHeight)
+	S.g = g
+	S.vyReal = vy
+	S.vy = vy * CONFIG.HeightSafety
+	S.speed = hum.WalkSpeed
+	S.rootH = measureRootH(hum, root)
+	S.maxH = S.vy * S.vy / (2 * g)
+end
+
+-- time to come back down to (takeoff height + dh)
+local function flightTime(dh)
+	local disc = S.vy * S.vy - 2 * S.g * dh
+	if disc < 0 then return nil end
+	return (S.vy + math.sqrt(disc)) / S.g
+end
+
+local function checkYield()
+	if os.clock() - sliceStart > CONFIG.TimeSlice then
+		task.wait()
+		sliceStart = os.clock()
+		if currentToken ~= searchId then error(CANCEL, 0) end
+	end
+end
+
+---------------------------------------------------------------- hazards (kill bricks)
+-- There is no universal "kill brick" flag, so each part gets a score from many weak signals:
+--   name / parent names / tags / attributes / child scripts (kill, lava, damage, ...)  +3
+--   learned from your own deaths + damage (exact part, or same colour+material twice)   +5
+--   CrackedLava material +2.5, red/orange colour +1.6, TouchInterest +1, Fire child +1, Neon +0.5
+-- score >= HazardThreshold = deadly. "safe / checkpoint / nokill / spawn" names always win.
+local HAZ_WORDS = { "kill", "lava", "death", "deadly", "lethal", "damage", "hurt", "harm", "hazard",
+	"danger", "spike", "trap", "acid", "poison", "toxic", "fatal", "laser", "burn", "zap", "magma" }
+local SAFE_WORDS = { "safe", "nokill", "antikill", "nodamage", "checkpoint", "spawn", "heal" }
+
+local learned = env.__APLearned or setmetatable({}, { __mode = "k" }) -- part -> blame points
+env.__APLearned = learned
+local sigHaz = env.__APSigs or {}                                     -- colour+material -> #parts blamed
+env.__APSigs = sigHaz
+local hazardCache = setmetatable({}, { __mode = "k" })
+local tempBlocked = {}
+local bodyCache = {}
+
+local function textScore(str)
+	str = string.lower(str)
+	for _, w in ipairs(SAFE_WORDS) do
+		if string.find(str, w, 1, true) then return -4 end
+	end
+	for _, w in ipairs(HAZ_WORDS) do
+		if string.find(str, w, 1, true) then return 3 end
+	end
+	return 0
+end
+
+local function signature(part)
+	local c = part.Color
+	if math.max(c.R, c.G, c.B) - math.min(c.R, c.G, c.B) < 0.25 then return nil end -- grey/white: too generic
+	return string.format("%d,%d,%d,%s", math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255), part.Material.Name)
+end
+
+local function computeHazard(part)
+	if (learned[part] or 0) >= 2 then return true end
+	local sig = signature(part)
+	if sig and (sigHaz[sig] or 0) >= 2 then return true end
+	local pts = 0
+
+	local inst, depth = part, 0
+	while inst and inst ~= Workspace and depth < 4 do
+		local sc = textScore(inst.Name)
+		if sc < 0 then return false end
+		if sc > 0 then
+			pts += sc
+			break
+		end
+		inst, depth = inst.Parent, depth + 1
+	end
+	for _, tag in ipairs(CollectionService:GetTags(part)) do
+		if textScore(tag) > 0 then pts += 3 break end
+	end
+	for k, v in pairs(part:GetAttributes()) do
+		if textScore(k) > 0 and (v == true or (type(v) == "number" and v > 0)) then pts += 3 break end
+	end
+	for _, c in ipairs(part:GetChildren()) do
+		local cn = c.ClassName
+		if cn == "TouchTransmitter" or cn == "Fire" then
+			pts += 1
+		elseif cn ~= "Decal" and cn ~= "Texture" and textScore(c.Name) > 0 then
+			pts += 3
+		end
+	end
+	local col = part.Color
+	if col.R >= 0.65 and col.G <= 0.45 and col.B <= 0.25 and col.R - col.G >= 0.3 then pts += 1.6 end
+	if part.Material == Enum.Material.CrackedLava then
+		pts += 2.5
+	elseif part.Material == Enum.Material.Neon then
+		pts += 0.5
+	end
+	return pts >= CONFIG.HazardThreshold
+end
+
+local function hazardPart(part)
+	if not CONFIG.AvoidHazards or not part then return false end
+	local c = hazardCache[part]
+	if c == nil then
+		local ok, res = pcall(computeHazard, part)
+		c = ok and res or false
+		hazardCache[part] = c
+	end
+	return c
+end
+
+local function isHazardHit(res)
+	if not CONFIG.AvoidHazards or not res or not res.Instance then return false end
+	if res.Instance:IsA("Terrain") then return res.Material == Enum.Material.CrackedLava end
+	return hazardPart(res.Instance)
+end
+
+local function hazardBox(cf, size)
+	if not CONFIG.AvoidHazards then return false end
+	for _, p in ipairs(Workspace:GetPartBoundsInBox(cf, size, hazardOverlap)) do
+		if p.ClassName ~= "Terrain" and hazardPart(p) then return true end
+	end
+	return false
+end
+
+local function cellKey(p)
+	return (math.floor(p.X / 1.5 + 0.5) * 100003 + math.floor(p.Z / 1.5 + 0.5)) * 4001 + math.floor(p.Y / 2 + 0.5)
+end
+
+-- would a character standing at `pos` be touching something deadly (even a non-collidable zone)?
+local function hazardAtBody(pos)
+	if not CONFIG.AvoidHazards then return false end
+	local k = cellKey(pos)
+	local t = tempBlocked[k]
+	if t then
+		if t > os.clock() then return true end
+		tempBlocked[k] = nil
+	end
+	local c = bodyCache[k]
+	if c == nil then
+		c = hazardBox(CFrame.new(pos.X, pos.Y + 2.9, pos.Z), V3(2.6, 5.4, 2.6))
+		bodyCache[k] = c
+	end
+	return c
+end
+
+---------------------------------------------------------------- slippery surfaces
+-- friction = the part's CustomPhysicalProperties, else the material default (Ice 0.02, Glacier 0.05, ...)
+local matCache = {}
+local function matFriction(mat)
+	local f = matCache[mat]
+	if f == nil then
+		local ok, pp = pcall(PhysicalProperties.new, mat)
+		f = ok and pp.Friction or 0.3
+		matCache[mat] = f
+	end
+	return f
+end
+
+local frictionCache = setmetatable({}, { __mode = "k" })
+local function frictionOfPart(part)
+	local f = frictionCache[part]
+	if f == nil then
+		local cp = part.CustomPhysicalProperties
+		f = cp and cp.Friction or matFriction(part.Material)
+		frictionCache[part] = f
+	end
+	return f
+end
+
+local function isSlipperyPart(part)
+	return CONFIG.IceSupport and part ~= nil and frictionOfPart(part) < CONFIG.SlipperyFriction
+end
+
+local function isSlipperyHit(res)
+	if not CONFIG.IceSupport or not res or not res.Instance then return false end
+	if res.Instance:IsA("Terrain") then return matFriction(res.Material) < CONFIG.SlipperyFriction end
+	return frictionOfPart(res.Instance) < CONFIG.SlipperyFriction
+end
+
+-- on ice, nodes near an edge are expensive: the path hugs the middle of the platform
+local function slipEdgePenalty(b)
+	local m = CONFIG.SlipEdgeMargin
+	local miss = 0
+	for _, o in ipairs({ { m, 0 }, { -m, 0 }, { 0, m }, { 0, -m } }) do
+		local r = raycast(V3(b.X + o[1], b.Y + 1.2, b.Z + o[2]), V3(0, -2.6, 0))
+		if not r or r.Normal.Y < COS_SLOPE then miss += 1 end
+	end
+	return miss * CONFIG.SlipEdgePenalty
+end
+
+---------------------------------------------------------------- jump edges
+-- finds the point where we should leave the ground when heading to `dir`
+local function findTakeoff(P, dir, maxLen)
+	local wall = sweep(P + V3(0, MID_H, 0), dir * maxLen, RADIUS)
+	local limit = wall and math.max(0, wall.Distance - 0.05) or maxLen
+	local lastP = P
+	local k = 1
+	while k * 0.5 <= limit do
+		local p = P + dir * (k * 0.5)
+		local r = raycast(V3(p.X, lastP.Y + 1.2, p.Z), V3(0, -2.6, 0))
+		if r and r.Normal.Y >= COS_SLOPE and not isHazardHit(r) then
+			lastP = r.Position
+		else
+			local T = lastP - dir * CONFIG.TakeoffInset
+			if (T - P):Dot(dir) < 0 then T = P end
+			return T
+		end
+		k += 1
+	end
+	if wall then return lastP end -- jumping UP onto something: stand-off at the wall
+	return nil                    -- floor continues, no ledge here
+end
+
+-- body-sized sweeps along the predicted arc
+local function arcClear(T, L, t, legs, steps)
+	local N = steps or 5
+	local lip = (L.Y - T.Y > CONFIG.StepUp) and L.Y or nil
+	local prev
+	for i = 0, N do
+		local s = i / N
+		local tt = t * s
+		local p = V3(
+			T.X + (L.X - T.X) * s,
+			T.Y + S.rootH + S.vy * tt - 0.5 * S.g * tt * tt,
+			T.Z + (L.Z - T.Z) * s
+		)
+		if i >= 1 and i < N and hazardBox(CFrame.new(p), V3(2.2, 4.8, 2.2)) then return false end
+		if prev and (not lip or (prev.Y - S.rootH) >= lip - 0.5) then
+			local d = p - prev
+			if sweep(prev, d, RADIUS) or raycast(prev + V3(0, 2, 0), d)
+				or (legs and sweep(prev + V3(0, -1.8, 0), d, 0.8)) then return false end
+		end
+		prev = p
+	end
+	return true
+end
+
+local LERPS = { 0, 0.3, 0.6, 1 }
+local faceCache = {}
+local climbChecks = 0
+
+-- Top walkable face of a part. Works for blocks in ANY orientation, and for cylinders
+-- (a Roblox cylinder's round face is on its local X axis, so a flat disk is "rotated").
+local function topFace(part)
+	local cached = faceCache[part]
+	if cached ~= nil then return cached or nil end
+	local face = false
+	local skip = (part.ClassName == "Part" and part.Shape == Enum.PartType.Ball)
+		or part:IsA("WedgePart") or part:IsA("CornerWedgePart") or part:IsA("TrussPart")
+	if not skip then
+		local cf, size = part.CFrame, part.Size
+		local axes = { cf.RightVector, cf.UpVector, cf.LookVector }
+		local sz = { size.X, size.Y, size.Z }
+		local isCyl = part.ClassName == "Part" and part.Shape == Enum.PartType.Cylinder
+		local best, bd = nil, 0.8
+		for i = 1, 3 do
+			if not isCyl or i == 1 then
+				local d = math.abs(axes[i].Y)
+				if d >= bd then best, bd = i, d end
+			end
+		end
+		if best then
+			local sign = axes[best].Y >= 0 and 1 or -1
+			local j, k = best % 3 + 1, (best + 1) % 3 + 1
+			face = {
+				center = cf.Position + axes[best] * (sign * sz[best] / 2),
+				u = axes[j], v = axes[k], hu = sz[j] / 2, hv = sz[k] / 2,
+				thick = sz[best], circle = isCyl, r = math.min(size.Y, size.Z) / 2,
+			}
+		end
+	end
+	faceCache[part] = face
+	return face or nil
+end
+
+-- closest point on the face to P, pulled LandMargin inside the edge (circle-aware)
+local function nearestOnFace(face, P, margin)
+	margin = margin or CONFIG.LandMargin
+	local d = P - face.center
+	local du, dv = d:Dot(face.u), d:Dot(face.v)
+	if face.circle then
+		local maxR = math.max(0, face.r - margin)
+		local len = math.sqrt(du * du + dv * dv)
+		if len > maxR and len > 1e-4 then du, dv = du / len * maxR, dv / len * maxR end
+	else
+		local mu = math.max(0, face.hu - margin)
+		local mv = math.max(0, face.hv - margin)
+		du, dv = math.clamp(du, -mu, mu), math.clamp(dv, -mv, mv)
+	end
+	return face.center + face.u * du + face.v * dv
+end
+
+-- real surface under the bounding-box point (handles wavy / bumpy tops); falls back toward the center
+local function snapLanding(face, pt)
+	local win = math.min(face.thick, 6)
+	for _, f in ipairs(LERPS) do
+		local q = pt:Lerp(face.center, f)
+		local r = raycast(V3(q.X, q.Y + 1.5, q.Z), V3(0, -(1.5 + win), 0))
+		if r and r.Normal.Y >= COS_LAND and r.Position.Y <= q.Y + 0.6 and not isHazardHit(r) then return r end
+	end
+	return nil
+end
+
+local function buildJump(node, face, pt)
+	local P = node.pos
+	local r = snapLanding(face, pt)
+	if not r then return nil end
+	local L = r.Position
+	if hazardAtBody(L) then return nil end
+	local fv = V3(L.X - P.X, 0, L.Z - P.Z)
+	local fd = fv.Magnitude
+	if fd < 0.2 then return nil end
+	local dir = fv / fd
+	local T = findTakeoff(P, dir, math.min(fd, CONFIG.EdgeScan))
+	if not T then return nil end
+	local t = flightTime(L.Y - T.Y)
+	if not t then return nil end
+	local hd = flatDist(L, T)
+	if hd > S.speed * t * CONFIG.ReachSafety - 0.25 then return nil end
+	if not arcClear(T, L, t) then return nil end
+	return {
+		kind = "jump", pos = L, inst = r.Instance, takeoff = T,
+		cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + (isSlipperyHit(r) and CONFIG.SlipPenalty or 0),
+	}
+end
+
+local function expandJumps(node, out, climbOnly)
+	if S.vyReal < 10 or S.speed < 1 then return end
+	if jumpExpansions >= CONFIG.MaxJumpExpansions then return end
+	jumpExpansions += 1
+	local P = node.pos
+	local maxFall = math.max(0, math.min(CONFIG.MaxFall, P.Y - (Workspace.FallenPartsDestroyHeight + 15)))
+	local tMax = flightTime(-maxFall)
+	if not tMax then return end
+	local radius = math.min(S.speed * tMax + CONFIG.EdgeScan, CONFIG.MaxQueryRadius)
+	local parts = Workspace:GetPartBoundsInRadius(P, radius, overlapParams)
+	local cands = {}
+	for _, part in ipairs(parts) do
+		if part ~= node.inst and part.ClassName ~= "Terrain" then
+			local face = topFace(part)
+			if face and not hazardPart(part) and not (CONFIG.ForbidSlippery and isSlipperyPart(part)) then
+				local pt = nearestOnFace(face, P)
+				local dh = pt.Y - P.Y
+				local fd = flatDist(pt, P)
+				if dh <= S.maxH - 0.3 and dh >= -maxFall and (fd > 2.2 or dh > CONFIG.StepUp)
+					and (not climbOnly or dh > CONFIG.StepUp) then
+					local t = flightTime(dh)
+					if t and fd - CONFIG.EdgeScan <= S.speed * t * CONFIG.ReachSafety then
+						local skip = false
+						if math.abs(dh) <= CONFIG.StepUp then
+							-- same level and floor continuous between us = walkable, no jump needed
+							local mid = (P + pt) / 2
+							if raycast(V3(mid.X, P.Y + 1.2, mid.Z), V3(0, -2.4, 0)) then skip = true end
+						end
+						if not skip then
+							cands[#cands + 1] = { pt = pt, face = face, score = heur(pt, goalPos) + fd * 0.25 }
+						end
+					end
+				end
+			end
+		end
+	end
+	table.sort(cands, function(a, b) return a.score < b.score end)
+	for i = 1, math.min(#cands, CONFIG.MaxJumpCandidates) do
+		local e = buildJump(node, cands[i].face, cands[i].pt)
+		if e then out[#out + 1] = e end
+		checkYield()
+	end
+end
+
+-- truss / ladder edges: climb up to a ledge near the top, or down to the ground near the bottom
+local function expandClimbs(node, out)
+	if climbChecks >= CONFIG.MaxClimbChecks then return end
+	climbChecks += 1
+	local P = node.pos
+	local parts = Workspace:GetPartBoundsInRadius(P, 5, overlapParams)
+	for _, part in ipairs(parts) do
+		if part.ClassName == "TrussPart" then
+			local cf, size = part.CFrame, part.Size
+			if math.abs(cf.UpVector.Y) >= 0.8 then
+				local ext = 0.5 * (size.Y * math.abs(cf.UpVector.Y)
+					+ size.X * math.abs(cf.RightVector.Y) + size.Z * math.abs(cf.LookVector.Y))
+				local c = cf.Position
+				local topY, botY = c.Y + ext, c.Y - ext
+				local hw = math.max(size.X, size.Z) * 0.5
+				if flatDist(P, c) - hw <= 3.2 then
+					for _, up in ipairs({ true, false }) do
+						local can = (up and (P.Y <= botY + 4 and topY - P.Y >= 3))
+							or (not up and (P.Y >= topY - 4 and P.Y - botY >= 3))
+						if can then
+							local best
+							for a = 0, 7 do
+								local ang = a * math.pi / 4
+								local x, z = c.X + math.cos(ang) * (hw + 2), c.Z + math.sin(ang) * (hw + 2)
+								local r = raycast(V3(x, up and (topY + 2.5) or (botY + 4), z), V3(0, -7, 0))
+								if r and r.Instance ~= part and r.Normal.Y >= COS_LAND and not isHazardHit(r) then
+									local ey = r.Position.Y
+									local ok = (up and (ey >= P.Y + 3 and ey <= topY + 1.2))
+										or (not up and (ey <= P.Y - 3 and ey >= botY - 3))
+									if ok then
+										local sc = (r.Position - goalPos).Magnitude
+										if not best or sc < best.sc then best = { r = r, sc = sc } end
+									end
+								end
+							end
+							if best then
+								local E = best.r.Position
+								out[#out + 1] = {
+									kind = "climb", pos = E, inst = best.r.Instance, truss = part,
+									topY = topY, botY = botY, up = up, from = P,
+									cost = math.abs(E.Y - P.Y) * 0.8 + flatDist(P, E) + 3,
+								}
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+-- Falls onto ANY ground (terrain included). For every direction we sample the ground below at growing
+-- distances from the ledge; each sample's own depth gives its own air time, so the horizontal reach is
+-- counted per sample:   t = (vy + sqrt(vy^2 + 2*g*depth)) / g,   reach = WalkSpeed * t.   Deeper = farther.
+local FALL_DIRS = 8
+local FALL_RADII = { 2.5, 4, 6, 9, 13, 18, 25, 35, 50, 70, 100 }
+
+local function expandFalls(node, out)
+	if S.vyReal < 10 or S.speed < 1 then return end
+	if fallExpansions >= CONFIG.MaxFallExpansions then return end
+	fallExpansions += 1
+	local P = node.pos
+	local voidY = Workspace.FallenPartsDestroyHeight + 15
+	local found = {}
+	for k = 0, FALL_DIRS - 1 do
+		local ang = k * (2 * math.pi / FALL_DIRS)
+		local dir = V3(math.cos(ang), 0, math.sin(ang))
+		local T = findTakeoff(P, dir, CONFIG.EdgeScan)
+		if T then
+			local depthMax = math.min(CONFIG.MaxFall, T.Y - voidY)
+			local best
+			if depthMax > 1 then
+				for _, r in ipairs(FALL_RADII) do
+					local q = T + dir * r
+					local hit = raycast(V3(q.X, T.Y + 2, q.Z), V3(0, -(2 + depthMax), 0))
+					if hit and hit.Normal.Y >= COS_LAND and not isHazardHit(hit) and hit.Position.Y < T.Y - 1
+						and not (CONFIG.ForbidSlippery and isSlipperyHit(hit)) then
+						local L = hit.Position
+						local t = flightTime(L.Y - T.Y)
+						if t and flatDist(L, T) <= S.speed * t * CONFIG.ReachSafety - 0.25 then
+							local sc = heur(L, goalPos)
+							if not best or sc < best.sc then best = { L = L, inst = hit.Instance, T = T, sc = sc, slip = isSlipperyHit(hit) } end
+						end
+					end
+				end
+			end
+			if best then found[#found + 1] = best end
+		end
+		checkYield()
+	end
+	table.sort(found, function(a, b) return a.sc < b.sc end)
+	for i = 1, math.min(#found, 3) do
+		local c = found[i]
+		local t = flightTime(c.L.Y - c.T.Y)
+		if t and not hazardAtBody(c.L) and arcClear(c.T, c.L, t) then
+			out[#out + 1] = {
+				kind = "jump", pos = c.L, inst = c.inst, takeoff = c.T,
+				cost = flatDist(P, c.T) + flatDist(c.L, c.T) + CONFIG.JumpPenalty + (c.slip and CONFIG.SlipPenalty or 0),
+			}
+		end
+		checkYield()
+	end
+end
+
+---------------------------------------------------------------- walk edges
+local function pathClear(a, q, radius)
+	local d = q - a
+	if sweep(a + V3(0, MID_H, 0), d, radius) then return false end
+	if raycast(a + V3(0, HEAD_H, 0), d) then return false end
+	return true
+end
+
+local function rampOK(a, b)
+	local mx, mz, my = (a.X + b.X) / 2, (a.Z + b.Z) / 2, (a.Y + b.Y) / 2
+	local r = raycast(V3(mx, my + 1.2, mz), V3(0, -2.4, 0))
+	return r ~= nil and r.Normal.Y >= COS_SLOPE and math.abs(r.Position.Y - my) < 0.7
+end
+
+-- Vault: a wall blocks the way (  _|_  ). Probe the far side column by column, find the first ground
+-- past the wall, then find a takeoff point far enough back that the arc (body + LEGS) is above the wall
+-- top before it reaches it, and that WalkSpeed * airtime covers the distance to the landing spot.
+local VAULT_RUNUPS = { 1.2, 1.8, 2.5, 3.5, 5, 7 } -- distance from takeoff to the wall face
+
+local function buildVault(node, d)
+	local P = node.pos
+	local wall = sweep(P + V3(0, MID_H, 0), d * 3.4, RADIUS)
+	if not wall then return nil end
+	local face = wall.Distance + RADIUS -- distance from P to the wall face
+	-- anything at apex height in the way = wall taller than we can ever clear
+	if sweep(P + V3(0, S.maxH + 0.2, 0), d * (face + 1.5), 0.5) then return nil end
+
+	local top0 = P.Y + S.maxH + 1
+	local down = S.maxH + 1 + 40
+	local sFar
+	local s = face + 0.25
+	while s <= face + CONFIG.MaxWallThickness do
+		local q = P + d * s
+		local hit = raycast(V3(q.X, top0, q.Z), V3(0, -down, 0))
+		if not hit then return nil end -- void beyond
+		if hit.Position.Y <= P.Y + CONFIG.StepUp then
+			if hit.Normal.Y >= COS_SLOPE and not isHazardHit(hit) then sFar = s end
+			break
+		end
+		s += 0.5
+	end
+	if not sFar then return nil end
+
+	-- landing a bit past the wall's far face
+	local L, Linst
+	for _, extra in ipairs({ 1.0, 0.5, 0 }) do
+		local q = P + d * (sFar + extra)
+		local hit = raycast(V3(q.X, top0, q.Z), V3(0, -down, 0))
+		if hit and hit.Normal.Y >= COS_LAND and not isHazardHit(hit) and hit.Position.Y <= P.Y + CONFIG.StepUp
+			and not hazardAtBody(hit.Position) then
+			L, Linst = hit.Position, hit.Instance
+			break
+		end
+	end
+	if not L then return nil end
+
+	for _, b in ipairs(VAULT_RUNUPS) do
+		local T0 = P + d * (face - b)
+		local tr = raycast(V3(T0.X, P.Y + 1.2, T0.Z), V3(0, -2.6, 0))
+		if tr and tr.Normal.Y >= COS_SLOPE and not isHazardHit(tr) and math.abs(tr.Position.Y - P.Y) < 1.2 then
+			local T = tr.Position
+			local t = flightTime(L.Y - T.Y)
+			if t then
+				local D = flatDist(L, T)
+				if D <= S.speed * t * CONFIG.ReachSafety - 0.25
+					and (face - b >= 0 or pathClear(P, T, RADIUS))
+					and arcClear(T, L, t, true, 8) then
+					return {
+						kind = "jump", vault = true, pos = L, inst = Linst, takeoff = T,
+						cost = flatDist(P, T) + D + CONFIG.JumpPenalty + 2,
+					}
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function expandVaults(node, out, dirs)
+	if S.vyReal < 10 or S.speed < 1 then return end
+	local gd = flat(goalPos - node.pos)
+	for _, d in ipairs(dirs) do
+		if vaultExpansions >= CONFIG.MaxVaultExpansions then return end
+		if gd.Magnitude < 1 or d:Dot(gd.Unit) > -0.05 then -- only walls between us and the goal
+			vaultExpansions += 1
+			local e = buildVault(node, d)
+			if e then out[#out + 1] = e end
+			checkYield()
+		end
+	end
+end
+
+-- returns pos, inst, cost, isDrop   |   nil, reason ("gap" / "block")
+local function tryWalk(a, tx, tz)
+	local ay = a.Y
+	local su = CONFIG.StepUp
+	local down = math.min(su + 0.3 + CONFIG.MaxFall, ay + su + 0.3 - (Workspace.FallenPartsDestroyHeight + 15))
+	if down <= su then return nil, "gap" end
+	local r = raycast(V3(tx, ay + su + 0.3, tz), V3(0, -down, 0))
+	if r and r.Normal.Y >= COS_SLOPE then
+		if isHazardHit(r) then return nil, "gap" end -- lava / kill brick = not floor, jump over it
+		local slip = isSlipperyHit(r)
+		if slip and CONFIG.ForbidSlippery then return nil, "gap" end
+		local b = r.Position
+		if b.Y < Workspace.FallenPartsDestroyHeight + 15 then return nil, "gap" end
+		local dy = b.Y - ay
+		local q, ok, drop = b, true, false
+		if dy > su then
+			ok = rampOK(a, b)
+		elseif dy < -su then
+			q = V3(b.X, ay, b.Z) -- walk off the ledge, then fall
+			drop = true
+		end
+		if ok and pathClear(a, q, RADIUS) and not hazardAtBody(b) then
+			local cost = flatDist(a, b) + (drop and (2 + math.abs(dy) * 0.05) or math.abs(dy) * 0.3)
+			if slip then
+				cost += CONFIG.SlipPenalty
+				if CONFIG.SlipEdgePenalty > 0 then cost += slipEdgePenalty(b) end
+			end
+			return b, r.Instance, cost, drop
+		end
+	end
+	-- steep ramp probe (rise bigger than a step)
+	local top = ay + math.min(CELL * math.tan(math.rad(CONFIG.MaxSlopeDeg)), 8)
+	local r2 = raycast(V3(tx, top, tz), V3(0, -(top - ay - su), 0))
+	if r2 and r2.Normal.Y >= COS_SLOPE then
+		local b = r2.Position
+		if rampOK(a, b) and pathClear(a, b, RADIUS * 0.5) and not isHazardHit(r2) and not hazardAtBody(b) then
+			return b, r2.Instance, flatDist(a, b) + (b.Y - ay) * 0.5, false
+		end
+	end
+	return nil, (r == nil) and "gap" or "block"
+end
+
+local function expandWalk(node, out)
+	local p = node.pos
+	local gaps, blocks = 0, 0
+	local bdirs = {}
+	for i = 1, 8 do
+		local o = OFFSETS[i]
+		local b, inst, cost, drop = tryWalk(p, p.X + o[1] * CELL, p.Z + o[2] * CELL)
+		if b then
+			out[#out + 1] = { kind = "walk", pos = b, inst = inst, cost = cost, drop = drop, from = p }
+			if drop then gaps += 1 end
+		elseif inst == "gap" then
+			gaps += 1
+		else
+			blocks += 1
+			bdirs[#bdirs + 1] = V3(o[1], 0, o[2]).Unit
+		end
+	end
+	return gaps, blocks, bdirs
+end
+
+---------------------------------------------------------------- A*
+local function keyOf(p)
+	local qx = math.floor(p.X + 0.5) + 100000
+	local qz = math.floor(p.Z + 0.5) + 100000
+	local qy = math.floor(p.Y * 0.5 + 0.5) + 2000
+	return (qx * 200003 + qz) * 4001 + qy
+end
+
+local function heapPush(h, item, pri)
+	local n = h.n + 1
+	h.n = n
+	local items, pris = h.items, h.pris
+	local i = n
+	while i > 1 do
+		local parent = i // 2
+		if pris[parent] <= pri then break end
+		items[i], pris[i] = items[parent], pris[parent]
+		i = parent
+	end
+	items[i], pris[i] = item, pri
+end
+
+local function heapPop(h)
+	local items, pris, n = h.items, h.pris, h.n
+	local top = items[1]
+	local item, pri = items[n], pris[n]
+	items[n], pris[n] = nil, nil
+	n -= 1
+	h.n = n
+	if n > 0 then
+		local i = 1
+		while true do
+			local c = i * 2
+			if c > n then break end
+			if c < n and pris[c + 1] < pris[c] then c += 1 end
+			if pris[c] >= pri then break end
+			items[i], pris[i] = items[c], pris[c]
+			i = c
+		end
+		items[i], pris[i] = item, pri
+	end
+	return top
+end
+
+local function findPath(startPos, startInst, goal, weight)
+	local nodes = {}
+	local open = { n = 0, items = {}, pris = {} }
+	local W = weight or CONFIG.HeuristicWeight
+	jumpExpansions = 0
+	fallExpansions = 0
+	vaultExpansions = 0
+
+	local function getNode(pos, inst)
+		local k = keyOf(pos)
+		local n = nodes[k]
+		if not n then
+			n = { pos = pos, inst = inst, g = math.huge, h = heur(pos, goal) }
+			nodes[k] = n
+		end
+		return n
+	end
+
+	faceCache = {}
+	climbChecks = 0
+	bodyCache = {}
+	local s = getNode(startPos, startInst)
+	s.g = 0
+	s.landing = true
+	s.maxH = s.h
+	heapPush(open, s, s.h * W)
+	local best, count = s, 0
+	local bestScore = s.h
+	local out = {}
+
+	while open.n > 0 do
+		local n = heapPop(open)
+		if not n.closed then
+			n.closed = true
+			count += 1
+			if flatDist(n.pos, goal) <= CONFIG.GoalTolerance and math.abs(n.pos.Y - goal.Y) <= 4 then
+				return n, true, count
+			end
+			-- fallback target for unreachable goals: closest node whose route never moved AWAY from the goal
+			if n.maxH <= s.h + CONFIG.BacktrackTol then
+				local sc = n.h + CONFIG.FallbackPathWeight * n.g
+				if sc < bestScore then best, bestScore = n, sc end
+			end
+			if count >= CONFIG.MaxNodes then break end
+
+			table.clear(out)
+			local gaps, blocks, bdirs = expandWalk(n, out)
+			if n.landing or gaps >= 2 then
+				expandJumps(n, out, false)
+			elseif gaps + blocks >= 3 then
+				expandJumps(n, out, true)
+			end
+			if (n.landing or gaps >= 2) and goal.Y < n.pos.Y - 4 then
+				expandFalls(n, out) -- target is lower: consider dropping off ledges (reach counted per sample)
+			end
+			if CONFIG.ClimbEnabled and (blocks >= 1 or n.landing) then
+				expandClimbs(n, out)
+			end
+			if CONFIG.VaultEnabled and #bdirs > 0 then
+				expandVaults(n, out, bdirs)
+			end
+
+			for _, e in ipairs(out) do
+				local m = getNode(e.pos, e.inst)
+				if not m.closed then
+					local ng = n.g + e.cost
+					if ng < m.g then
+						m.g, m.parent, m.edge = ng, n, e
+						m.pos, m.inst = e.pos, e.inst
+						m.landing = (e.kind ~= "walk")
+						m.h = heur(m.pos, goal)
+						m.maxH = math.max(n.maxH, m.h)
+						heapPush(open, m, ng + m.h * W)
+					end
+				end
+			end
+		end
+		checkYield()
+	end
+	if s.h - best.h < 2 then best = s end -- no real forward progress possible: stay put
+	return best, false, count
+end
+
+local function simplify(steps, startPos)
+	local out = {}
+	local prev = startPos
+	for i, st in ipairs(steps) do
+		local nxt = steps[i + 1]
+		local drop = false
+		if st.kind == "walk" and nxt and nxt.kind == "walk" then
+			local d1, d2 = flat(st.pos - prev), flat(nxt.pos - st.pos)
+			if d1.Magnitude > 0.01 and d2.Magnitude > 0.01
+				and d1.Unit:Dot(d2.Unit) > 0.995
+				and math.abs((st.pos.Y - prev.Y) / d1.Magnitude - (nxt.pos.Y - st.pos.Y) / d2.Magnitude) < 0.15 then
+				drop = true -- collinear, skip waypoint (keeps `prev` as last kept point)
+			end
+		end
+		if not drop then
+			out[#out + 1] = st
+			prev = (st.kind == "jump") and st.land or (st.kind == "climb" and st.exit or st.pos)
+		end
+	end
+	return out
+end
+
+local function buildSteps(endNode, goal, complete, startPos)
+	local chain = {}
+	local n = endNode
+	while n do table.insert(chain, 1, n); n = n.parent end
+	local steps = {}
+	for i = 2, #chain do
+		local e = chain[i].edge
+		if e.kind == "climb" then
+			local fd = flat(e.truss.Position - e.from)
+			steps[#steps + 1] = {
+				kind = "climb", truss = e.truss, exit = e.pos, topY = e.topY, botY = e.botY, up = e.up,
+				dir = fd.Magnitude > 0.01 and fd.Unit or V3(0, 0, 1),
+			}
+		elseif e.kind == "jump" then
+			local d = flat(e.pos - e.takeoff)
+			steps[#steps + 1] = {
+				kind = "jump", takeoff = e.takeoff, land = e.pos,
+				dir = d.Magnitude > 0.01 and d.Unit or V3(0, 0, 1),
+				lip = (e.pos.Y - e.takeoff.Y) > CONFIG.StepUp, vault = e.vault,
+			}
+		elseif e.drop then
+			-- walk off a ledge and fall (any depth): handled like a jump with no jump, steered to the landing
+			local fd = flat(e.pos - e.from)
+			steps[#steps + 1] = {
+				kind = "jump", fall = true, takeoff = e.from, land = e.pos,
+				dir = fd.Magnitude > 0.01 and fd.Unit or V3(0, 0, 1), lip = false,
+			}
+		else
+			steps[#steps + 1] = { kind = "walk", pos = e.pos }
+		end
+	end
+	if complete then steps[#steps + 1] = { kind = "walk", pos = goal } end
+	return simplify(steps, startPos)
+end
+
+local function drawPath(steps)
+	visuals:ClearAllChildren()
+	if not CONFIG.ShowPath then return end
+	for i, s in ipairs(steps) do
+		if s.kind == "walk" then
+			local last = i == #steps
+			marker(s.pos, last and WHITE or GREEN, last and 1.4 or 0.7)
+		elseif s.kind == "climb" then
+			marker(s.exit, Color3.fromRGB(190, 120, 255), 1.1)
+		elseif s.fall then
+			marker(s.land, Color3.fromRGB(80, 170, 255), 1.1)
+		else
+			marker(s.takeoff, YELLOW, 0.9)
+			marker(s.land, RED, 1.1)
+		end
+	end
+end
+
+---------------------------------------------------------------- following
+local controls
+task.spawn(function()
+	local ok, res = pcall(function()
+		local ps = player:WaitForChild("PlayerScripts", 10)
+		local pm = ps and ps:WaitForChild("PlayerModule", 10)
+		return pm and require(pm):GetControls()
+	end)
+	if ok and res then controls = res end
+end)
+
+local MOVE_KEYS = {
+	Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+	Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right,
+}
+local function userSteering()
+	if controls then
+		local ok, v = pcall(function() return controls:GetMoveVector() end)
+		if ok and typeof(v) == "Vector3" and v.Magnitude > 0.25 then return true end
+	end
+	if not UserInputService:GetFocusedTextBox() then
+		for _, k in ipairs(MOVE_KEYS) do
+			if UserInputService:IsKeyDown(k) then return true end
+		end
+	end
+	return false
+end
+
+local function doJump(hum)
+	hum.Jump = true
+	pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+end
+
+local function stop(msg, color)
+	searchId += 1
+	retryId += 1
+	brakeUntil = 0
+	follow = nil
+	visuals:ClearAllChildren()
+	local _, hum = getChar()
+	if hum then hum:Move(Vector3.zero, false) end
+	if msg then notify(msg, color) end
+end
+
+local startSearch
+
+local function finish(f)
+	follow = nil
+	local _, hum, root = getChar()
+	if hum then hum:Move(Vector3.zero, false) end
+	if hum and root and CONFIG.IceSupport then
+		local r = raycast(root.Position, V3(0, -(S.rootH + 3), 0))
+		if r and isSlipperyHit(r) then brakeUntil = os.clock() + 1.5 end -- ice: counter-steer to stop
+	end
+	task.delay(1.2, function() if not follow then visuals:ClearAllChildren() end end)
+	retryId += 1
+	local rid = retryId
+	local goal = f.goal
+
+	if f.partial then
+		-- reached the closest point: keep trying the real target (things may move / open up)
+		notify("Closest point - retrying target...", ORANGE)
+		task.spawn(function()
+			task.wait(0.4)
+			for _ = 1, CONFIG.RetryAttempts do
+				if rid ~= retryId or not active or follow then return end
+				if searchingId == 0 then startSearch(goal, { retry = true, quiet = true }) end
+				local t0 = os.clock()
+				while os.clock() - t0 < CONFIG.RetryInterval do
+					task.wait(0.1)
+					if rid ~= retryId or not active or follow then return end
+				end
+			end
+			if rid == retryId and active and not follow then notify("Target unreachable", RED) end
+		end)
+	else
+		notify("Arrived", GREEN)
+		if (f.holds or 0) < 4 then
+			-- brief hold: if something pushes us off the spot, walk back
+			task.spawn(function()
+				local t0 = os.clock()
+				while os.clock() - t0 < CONFIG.HoldSeconds do
+					task.wait(0.2)
+					if rid ~= retryId or not active or follow then return end
+					local _, h, root = getChar()
+					if not h or userSteering() then return end
+					if flatDist(root.Position, goal) > CONFIG.HoldDrift then
+						startSearch(goal, { quiet = true, retry = true, holds = (f.holds or 0) + 1 })
+						return
+					end
+				end
+			end)
+		end
+	end
+end
+
+-- free = deviation (pushed off route) rather than a failure, so it doesn't burn the failure budget
+local function replan(f, reason, free)
+	if free then
+		if f.reroutes >= CONFIG.MaxReroutes then
+			stop("Too many deviations", RED)
+		else
+			startSearch(f.goal, { replans = f.replans, reroutes = f.reroutes + 1, quiet = true, holds = f.holds })
+		end
+	elseif f.replans >= CONFIG.MaxReplans then
+		stop("Path failed (" .. reason .. ")", RED)
+	else
+		startSearch(f.goal, { replans = f.replans + 1, reroutes = f.reroutes, quiet = true, holds = f.holds })
+	end
+end
+
+startSearch = function(goal, opts)
+	opts = opts or {}
+	searchId += 1
+	local my = searchId
+	searchingId = my
+	follow = nil
+	task.spawn(function()
+		local function run()
+			local _, hum, root = getChar()
+			local waited = 0
+			while hum and hum.FloorMaterial == Enum.Material.Air and waited < 3 do
+				task.wait(0.1)
+				waited += 0.1
+				if my ~= searchId then return end
+				_, hum, root = getChar()
+			end
+			if not hum then return end
+			refreshFilter()
+			readStats(hum, root)
+			local g0 = raycast(root.Position, V3(0, -15, 0))
+			local inst0 = g0 and g0.Instance
+			local startPos = g0 and g0.Position or (root.Position - V3(0, S.rootH, 0))
+			currentToken, goalPos, sliceStart = my, goal, os.clock()
+			if not opts.quiet then notify("Pathfinding...", WHITE) end
+
+			local ok, endNode, complete = pcall(findPath, startPos, inst0, goal)
+			if my ~= searchId or not active then return end
+			if not ok then
+				if endNode ~= CANCEL then
+					warn("[AdvancedPathfinder] " .. tostring(endNode))
+					notify("Pathfinder error", RED)
+				end
+				return
+			end
+
+			if not complete then
+				if endNode.parent == nil then
+					if not opts.retry then notify("No path - staying put", RED) end
+					return
+				end
+				-- The first search is weighted toward the unreachable goal, so its route to the fallback
+				-- point can wander. Re-search straight to that point with plain A* for a direct route.
+				local fb = endNode.pos
+				goalPos, sliceStart = fb, os.clock()
+				local ok2, n2, c2 = pcall(findPath, startPos, inst0, fb, 1.0)
+				if my ~= searchId or not active then return end
+				if ok2 and c2 then endNode = n2 end
+				-- safety: refuse routes that wander away from the goal
+				local startH, worst, n = heur(startPos, goal), 0, endNode
+				while n do
+					worst = math.max(worst, heur(n.pos, goal))
+					n = n.parent
+				end
+				if worst > startH + CONFIG.BacktrackTol + 2 then
+					if not opts.retry then notify("No path - staying put", RED) end
+					return
+				end
+				if not opts.retry then notify("No full route - going to closest point", ORANGE) end
+			end
+
+			local steps = buildSteps(endNode, goal, complete, startPos)
+			if #steps == 0 then return end
+			follow = {
+				steps = steps, i = 1, prev = startPos, goal = goal, partial = not complete,
+				replans = opts.replans or 0, reroutes = opts.reroutes or 0, holds = opts.holds or 0,
+				lastPos = root.Position, lastT = os.clock(), stuck = 0,
+			}
+			drawPath(steps)
+		end
+		local ok, err = pcall(run)
+		if not ok then warn("[AdvancedPathfinder] " .. tostring(err)) end
+		if searchingId == my then searchingId = 0 end
+	end)
+end
+
+-- Ice control. Roblox ice lets you keep sliding and barely lets you accelerate, so:
+--  * we LEARN how hard the surface lets us accelerate (S.iceAccel, studs/s^2) from what actually happens
+--  * pure pursuit: aim at a point ahead ON the route line, so sideways slide gets pulled back to the line
+--  * speed plan: v = sqrt(vExit^2 + 2*a*dist) -> slow down just enough to make the corner / stop in time
+--  * steer on velocity ERROR: pushing against our own slide is what actually brakes us
+local function iceSteer(hum, root, f, step, fl, dist, last, speed, dt, feet)
+	local v = root.AssemblyLinearVelocity
+	local hv = V3(v.X, 0, v.Z)
+
+	-- learn traction from the last command
+	if f.iv and f.icmd and f.icmd.Magnitude > 0.5 and dt > 0 then
+		local meas = (hv - f.iv):Dot(f.icmd.Unit) / math.max(dt, 1 / 120)
+		if meas > 0.3 then
+			S.iceAccel = math.clamp(S.iceAccel * 0.92 + (meas / math.min(f.icmd.Magnitude, 1)) * 0.08, 1.5, 80)
+		end
+	end
+	f.iv = hv
+
+	-- pure pursuit point on the segment prev -> waypoint
+	local A, B = f.prev, step.pos
+	local seg = V3(B.X - A.X, 0, B.Z - A.Z)
+	local segLen = seg.Magnitude
+	local sd = (segLen > 0.1) and seg / segLen or fl / dist
+	local aim = fl / dist
+	if segLen > 0.5 then
+		local along = math.clamp((feet.X - A.X) * sd.X + (feet.Z - A.Z) * sd.Z, 0, segLen)
+		local tp = math.min(segLen, along + math.clamp(speed * 0.2 + 1.5, 1.5, 4.5))
+		local to2 = V3(A.X + sd.X * tp - feet.X, 0, A.Z + sd.Z * tp - feet.Z)
+		if to2.Magnitude > 0.05 then aim = to2.Unit end
+	end
+
+	-- how fast may we arrive at this waypoint (corner / stop), given real traction
+	local vExit = 0
+	if not last then
+		local nxt = f.steps[f.i + 1]
+		if nxt and nxt.kind == "walk" then
+			local nd = V3(nxt.pos.X - B.X, 0, nxt.pos.Z - B.Z)
+			vExit = (nd.Magnitude > 0.1) and speed * math.clamp(sd:Dot(nd.Unit), 0.25, 1) or speed
+		elseif nxt and nxt.kind == "jump" then
+			vExit = speed * math.clamp(sd:Dot(nxt.dir), 0.4, 1)  -- keep momentum into the takeoff
+		else
+			vExit = speed * 0.5
+		end
+	end
+	local vWant = math.min(speed, math.sqrt(vExit * vExit + 2 * S.iceAccel * math.max(dist - 0.3, 0)))
+
+	local err = (aim * vWant - hv) / math.max(speed, 1)
+	local mv = (err.Magnitude > 1) and err.Unit or err
+	f.icmd = mv
+	hum:Move(mv, false)
+end
+
+-- run-up to a takeoff point on ice: arrive at full speed with the velocity already pointing along the jump
+local function iceRunSteer(hum, root, toT, d, dir, speed)
+	local v = root.AssemblyLinearVelocity
+	local k = math.clamp(d / 3, 0, 1)
+	local aim = ((d > 0.05) and (toT / d) * k or Vector3.zero) + dir * (1 - k)
+	if aim.Magnitude < 0.01 then aim = dir end
+	local err = (aim.Unit * speed - V3(v.X, 0, v.Z)) / math.max(speed, 1)
+	hum:Move((err.Magnitude > 1) and err.Unit or err, false)
+end
+
+-- is the ground under us slippery? (cached, 10 Hz)
+local function groundSlip(f, root)
+	local now = os.clock()
+	if now - (f.slipT or 0) > 0.1 then
+		f.slipT = now
+		local r = raycast(root.Position, V3(0, -(S.rootH + 3), 0))
+		f.slip = r ~= nil and isSlipperyHit(r)
+	end
+	return f.slip
+end
+
+local function onStep(dt)
+	local f = follow
+	if not f and active and brakeUntil > os.clock() then
+		-- arrived on ice: push against our own velocity so we don't slide off the platform
+		local _, hum, root = getChar()
+		if hum and not userSteering() then
+			local v = root.AssemblyLinearVelocity
+			local hv = V3(v.X, 0, v.Z)
+			if hv.Magnitude < 1.2 then
+				brakeUntil = 0
+			else
+				local mv = -hv / math.max(hum.WalkSpeed, 1)
+				hum:Move(mv.Magnitude > 1 and mv.Unit or mv, false)
+			end
+		else
+			brakeUntil = 0
+		end
+		return
+	end
+	if not f or not active then return end
+	local _, hum, root = getChar()
+	if not hum then stop() return end
+	if userSteering() then stop("Manual control", ORANGE) return end
+
+	local pos = root.Position
+	local speed = hum.WalkSpeed
+	local rootH = S.rootH
+	local feet = pos - V3(0, rootH, 0)
+	local grounded = hum.FloorMaterial ~= Enum.Material.Air
+	local step = f.steps[f.i]
+
+	-- pushed ahead (conveyor etc.): if we're already at a later waypoint, skip to it
+	if step and step.kind == "walk" then
+		local reachedJ
+		for j = f.i + 1, math.min(f.i + 4, #f.steps) do
+			local sj = f.steps[j]
+			if sj.kind ~= "walk" then break end
+			local tj = sj.pos - feet
+			if math.sqrt(tj.X * tj.X + tj.Z * tj.Z) <= 1.3 and tj.Y < 3.5 and tj.Y > -4 then reachedJ = j end
+		end
+		if reachedJ then
+			f.prev = f.steps[reachedJ].pos
+			f.i = reachedJ + 1
+			step = f.steps[f.i]
+		end
+	end
+
+	local slip = CONFIG.IceSupport and grounded and groundSlip(f, root)
+
+	-- walking waypoints (never stops between them = no momentum loss)
+	while step and step.kind == "walk" do
+		local last = f.i == #f.steps
+		local to = step.pos - feet
+		local fl = V3(to.X, 0, to.Z)
+		local dist = fl.Magnitude
+		local reach = (last and 0.9 or math.max(1.3, speed * dt * 1.6)) + (slip and (last and 0.3 or 0.8) or 0)
+		local done = dist <= reach and to.Y < 3.5
+		if not done and not last and dist < 4 then
+			local seg = flat(step.pos - f.prev)
+			if seg.Magnitude > 0.1 and fl:Dot(seg.Unit) < 0 then done = true end
+		end
+		if not done then
+			if dist <= 0.05 then
+				hum:Move(Vector3.zero, false)
+			elseif slip then
+				iceSteer(hum, root, f, step, fl, dist, last, speed, dt, feet)
+			else
+				hum:Move(fl / dist, false)
+			end
+			break
+		end
+		f.prev = step.pos
+		f.i += 1
+		step = f.steps[f.i]
+	end
+	if not step then finish(f) return end
+
+	-- pushed off the route (conveyor, knockback, moving platform): re-plan from where we are now
+	if step.kind == "walk" and grounded then
+		local a, b = f.prev, step.pos
+		local abx, abz = b.X - a.X, b.Z - a.Z
+		local len2 = abx * abx + abz * abz
+		local t = 1
+		if len2 > 0.25 then
+			t = math.clamp(((feet.X - a.X) * abx + (feet.Z - a.Z) * abz) / len2, 0, 1)
+		end
+		local dx, dz = feet.X - (a.X + abx * t), feet.Z - (a.Z + abz * t)
+		if math.sqrt(dx * dx + dz * dz) > CONFIG.OffRoute then
+			if slip then tempBlocked[cellKey(step.pos)] = os.clock() + 20 end -- slid away: skip this ice for a while
+			replan(f, "pushed off route", true) return
+		end
+	end
+
+	-- hazard guard: something deadly right ahead (moving kill part / undetected zone)? hold, then route around it
+	if CONFIG.AvoidHazards and grounded and (step.kind == "walk" or step.phase ~= "air") then
+		local tgt = (step.kind == "walk") and step.pos or (step.fall and step.land or step.takeoff)
+		if tgt then
+			local now0 = os.clock()
+			if now0 - (f.hzT0 or 0) > 0.05 then
+				f.hzT0 = now0
+				f.hzAhead = nil
+				local dv = V3(tgt.X - feet.X, 0, tgt.Z - feet.Z)
+				local dl = dv.Magnitude
+				if dl > 0.3 then
+					local ahead = feet + (dv / dl) * math.min(dl, math.max(1.5, speed * 0.3))
+					if hazardBox(CFrame.new(ahead.X, ahead.Y + 2.9, ahead.Z), V3(2, 4.6, 2)) then f.hzAhead = ahead end
+				end
+			end
+			if f.hzAhead then
+				hum:Move(Vector3.zero, false)
+				f.hzWait = f.hzWait or os.clock()
+				f.lastT, f.lastPos = os.clock(), pos
+				if os.clock() - f.hzWait > 1.2 then
+					tempBlocked[cellKey(f.hzAhead)] = os.clock() + 4
+					f.hzWait, f.hzAhead = nil, nil
+					replan(f, "hazard ahead", true)
+				end
+				return
+			end
+			f.hzWait = nil
+		end
+	end
+
+	if step.kind == "climb" then
+		local truss, E = step.truss, step.exit
+		if not truss or not truss.Parent then replan(f, "truss gone") return end
+		if not step.phase then step.phase, step.t0 = "approach", os.clock() end
+		local tc = truss.Position
+		local into = V3(tc.X - feet.X, 0, tc.Z - feet.Z)
+		local il = into.Magnitude
+		local intoDir = (il > 0.05) and into / il or step.dir
+		local climbing = hum:GetState() == Enum.HumanoidStateType.Climbing
+		local elapsed = os.clock() - step.t0
+
+		if step.phase == "approach" then
+			hum:Move(intoDir, false) -- walk into the truss, the Humanoid grabs it on contact
+			if climbing then
+				step.phase, step.t0 = "climb", os.clock()
+			elseif elapsed > 4 then
+				replan(f, "couldn't reach truss") return
+			end
+		else
+			local toE = V3(E.X - feet.X, 0, E.Z - feet.Z)
+			local tl = toE.Magnitude
+			local toEDir = (tl > 0.05) and toE / tl or intoDir
+			local mv
+			if step.up then
+				-- push into the truss to climb up; near the top head for the ledge
+				mv = (feet.Y < step.topY - 1.2) and intoDir or toEDir
+			else
+				mv = (climbing and feet.Y > E.Y + 1.5) and -intoDir or toEDir
+			end
+			hum:Move(mv, false)
+			if grounded and not climbing and elapsed > 0.3 and math.abs(feet.Y - E.Y) <= 2 and tl <= 6 then
+				f.prev = E
+				f.i += 1
+			elseif elapsed > 15 or (grounded and not climbing and elapsed > 1.2 and math.abs(feet.Y - E.Y) > 3) then
+				replan(f, "lost the truss") return
+			end
+		end
+	elseif step.kind == "jump" then
+		local T, L = step.takeoff, step.land
+		if not step.phase then step.phase, step.t0 = "run", os.clock() end
+
+		if step.phase == "run" and step.fall then
+			-- walk off the ledge (no jump), then the air phase steers us onto the landing point
+			local toL = V3(L.X - feet.X, 0, L.Z - feet.Z)
+			local d = toL.Magnitude
+			hum:Move((d > 0.05) and toL / d or step.dir, false)
+			if not grounded then
+				step.phase, step.t0, step.left, step.tries = "air", os.clock(), true, 1
+			elseif d <= 1.3 and math.abs(feet.Y - L.Y) < 2.5 then
+				f.prev = L
+				f.i += 1
+			elseif os.clock() - step.t0 > 8 then
+				replan(f, "fall run-up timeout") return
+			end
+		elseif step.phase == "run" then
+			-- keep running at full speed, fire the jump WHILE moving
+			local toT = V3(T.X - feet.X, 0, T.Z - feet.Z)
+			local d = toT.Magnitude
+			local along = toT:Dot(step.dir)
+			local retreat = false
+			if step.vault and not step.ready then
+				if along >= 0.8 then step.ready = true else retreat = true end
+			end
+			if retreat then
+				local R = V3(T.X - step.dir.X * 1.4 - feet.X, 0, T.Z - step.dir.Z * 1.4 - feet.Z)
+				hum:Move((R.Magnitude > 0.05) and R.Unit or Vector3.zero, false)
+			elseif slip then
+				iceRunSteer(hum, root, toT, d, step.dir, speed)
+			else
+				hum:Move((d > 0.6) and (toT / d) or step.dir, false)
+			end
+			local rv = root.AssemblyLinearVelocity
+			local hs = slip and math.sqrt(rv.X * rv.X + rv.Z * rv.Z) or speed
+			if not retreat and grounded and along <= math.max(0.2, hs * dt * 1.25) then
+				-- re-check with the REAL position: if we got shoved off the takeoff line, don't jump short
+				local tNow = flightTime(L.Y - feet.Y)
+				if not tNow or flatDist(feet, L) > speed * tNow * 0.98 then
+					replan(f, "off the takeoff line", true) return
+				end
+				doJump(hum)
+				step.phase, step.t0, step.left, step.tries = "air", os.clock(), false, 1
+			elseif os.clock() - step.t0 > 8 then
+				replan(f, "run-up timeout") return
+			end
+		else
+			local vy = root.AssemblyLinearVelocity.Y
+			if not step.left and (not grounded or vy > 8) then step.left = true end
+			local elapsed = os.clock() - step.t0
+
+			if not step.left then
+				hum:Move(step.dir, false)
+				if elapsed > 0.35 then
+					if step.tries >= 3 then replan(f, "jump failed") return end
+					doJump(hum)
+					step.tries += 1
+					step.t0 = os.clock()
+				end
+			else
+				-- exact landing: distance left / time left -> throttle, every frame
+				local g = Workspace.Gravity
+				local h = (L.Y + rootH) - pos.Y
+				local disc = vy * vy - 2 * g * h
+				local t = (disc >= 0) and (vy + math.sqrt(disc)) / g or math.max(vy / g, 0)
+				local rem = V3(L.X - pos.X, 0, L.Z - pos.Z)
+				local rd = rem.Magnitude
+				local throttle
+				if rd < 0.12 then
+					throttle = 0
+				elseif t > 0.03 then
+					throttle = math.clamp(rd / t / math.max(speed, 0.1), 0, 1)
+				else
+					throttle = 1
+				end
+				if step.lip and feet.Y < L.Y - 0.3 then throttle = math.max(throttle, 0.6) end
+				local mv = (rd > 0.05) and (rem / rd) or step.dir
+				hum:Move(mv * throttle, false)
+				if CONFIG.VelocityAssist then
+					local v = mv * throttle * speed
+					root.AssemblyLinearVelocity = V3(v.X, vy, v.Z)
+				end
+
+				if grounded and vy < 5 and elapsed > 0.12 then
+					if flatDist(feet, L) > 3.5 then replan(f, "missed landing") return end
+					f.prev = L
+					f.i += 1
+				elseif elapsed > 6 + 1.5 * math.sqrt(2 * math.max(0, T.Y - L.Y) / g) then
+					replan(f, "air timeout") return
+				end
+			end
+		end
+	end
+
+	-- stuck detection
+	local now = os.clock()
+	if now - f.lastT > 1.25 then
+		local inAir = (step.kind == "jump" and step.phase == "air") or (step.kind == "climb" and step.phase == "climb")
+		if grounded and not inAir and flatDist(pos, f.lastPos) < 0.7 then
+			f.stuck += 1
+			if f.stuck == 1 then
+				doJump(hum)
+			else
+				if slip and step.kind == "walk" then tempBlocked[cellKey(step.pos)] = os.clock() + 30 end
+				replan(f, "stuck") return
+			end
+		else
+			f.stuck = 0
+		end
+		f.lastPos, f.lastT = pos, now
+	end
+end
+
+---------------------------------------------------------------- world tap
+local function pointer(input)
+	if input.UserInputType == Enum.UserInputType.Touch then
+		return Vector2.new(input.Position.X, input.Position.Y)
+	end
+	return UserInputService:GetMouseLocation()
+end
+
+local function rayFrom(input)
+	local cam = Workspace.CurrentCamera
+	if input.UserInputType == Enum.UserInputType.Touch then
+		return cam:ScreenPointToRay(input.Position.X, input.Position.Y)
+	end
+	local m = UserInputService:GetMouseLocation()
+	return cam:ViewportPointToRay(m.X, m.Y)
+end
+
+local function onWorldTap(ray)
+	refreshFilter()
+	local res = Workspace:Raycast(ray.Origin, ray.Direction * 2000, worldParams)
+	if not res then notify("Nothing there", ORANGE) return end
+	local ang = math.deg(math.acos(math.clamp(res.Normal.Y, -1, 1)))
+	if ang > CONFIG.MaxSlopeDeg then
+		notify(string.format("Too steep (%d°)", math.floor(ang + 0.5)), RED)
+		return
+	end
+	if not CONFIG.AllowHazardGoal and isHazardHit(res) then
+		notify("Kill brick - not going there", RED)
+		return
+	end
+	retryId += 1
+	startSearch(res.Position, {})
+end
+
+local pending = {}
+connect(UserInputService.InputBegan, function(input, gp)
+	if gp or not active then return end
+	local t = input.UserInputType
+	if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
+	local key = (t == Enum.UserInputType.Touch) and input or "mouse"
+	pending[key] = { t = os.clock(), start = pointer(input), ray = rayFrom(input) }
+end)
+connect(UserInputService.InputEnded, function(input)
+	local t = input.UserInputType
+	local key = (t == Enum.UserInputType.Touch) and input or (t == Enum.UserInputType.MouseButton1 and "mouse")
+	local p = key and pending[key]
+	if not p then return end
+	pending[key] = nil
+	if active and os.clock() - p.t <= CONFIG.TapTime and (pointer(input) - p.start).Magnitude <= CONFIG.TapMove then
+		onWorldTap(p.ray)
+	end
+end)
+
+---------------------------------------------------------------- toggle button (tap / hold-drag)
+local BIND = "AdvancedPathfinderStep"
+local pressInput, pressT, dragMode, dragStartPtr, dragStartPos
+
+local function refreshButton()
+	button.BackgroundColor3 = dragMode and DRAG_COLOR or (active and ON_COLOR or OFF_COLOR)
+	button.Size = dragMode and UDim2.fromOffset(68, 68) or UDim2.fromOffset(60, 60)
+end
+
+local function setActive(v)
+	if v == active then return end
+	active = v
+	refreshButton()
+	if v then
+		RunService:BindToRenderStep(BIND, Enum.RenderPriority.Last.Value, onStep) -- after the default controls
+		notify("Advanced Pathfinder ON - tap a spot", GREEN)
+	else
+		pcall(function() RunService:UnbindFromRenderStep(BIND) end)
+		stop()
+		notify("Advanced Pathfinder OFF", WHITE)
+	end
+end
+
+local function isButtonInput(input)
+	if not pressInput then return false end
+	if input == pressInput then return true end
+	return input.UserInputType == Enum.UserInputType.MouseButton1
+		and pressInput.UserInputType == Enum.UserInputType.MouseButton1
+end
+
+connect(button.InputBegan, function(input)
+	if pressInput then return end
+	local t = input.UserInputType
+	if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
+	pressInput, pressT, dragMode = input, os.clock(), false
+	local mine = input
+	task.delay(CONFIG.HoldTime, function()
+		if pressInput == mine and not dragMode then
+			dragMode = true
+			dragStartPtr = pointer(mine)
+			dragStartPos = button.AbsolutePosition + button.AbsoluteSize / 2
+			refreshButton()
+		end
+	end)
+end)
+
+connect(UserInputService.InputChanged, function(input)
+	if not (pressInput and dragMode) then return end
+	local t = input.UserInputType
+	if (t == Enum.UserInputType.Touch and input == pressInput)
+		or (t == Enum.UserInputType.MouseMovement and pressInput.UserInputType == Enum.UserInputType.MouseButton1) then
+		local p = dragStartPos + (pointer(pressInput) - dragStartPtr)
+		local sz, half = gui.AbsoluteSize, button.AbsoluteSize / 2
+		button.Position = UDim2.fromOffset(
+			math.clamp(p.X, half.X, math.max(half.X, sz.X - half.X)),
+			math.clamp(p.Y, half.Y, math.max(half.Y, sz.Y - half.Y))
+		)
+	end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+	if not isButtonInput(input) then return end
+	local wasDrag, held = dragMode, os.clock() - pressT
+	pressInput, dragMode = nil, false
+	refreshButton()
+	if not wasDrag and held < CONFIG.HoldTime then setActive(not active) end
+end)
+
+---------------------------------------------------------------- learning kill bricks
+local touchCount, touchStart, charConns = {}, {}, {}
+local lastHealth = 0
+
+local function blame(part, w)
+	if not part or not part.Parent then return end
+	local ts = touchStart[part]
+	if ts and os.clock() - ts > 1.5 then return end -- stood on it safely for a while: not the culprit
+	local before = learned[part] or 0
+	learned[part] = before + w
+	hazardCache = setmetatable({}, { __mode = "k" })
+	bodyCache = {}
+	if before < 2 and learned[part] >= 2 then
+		local sig = signature(part)
+		if sig then sigHaz[sig] = (sigHaz[sig] or 0) + 1 end
+		notify("Learned hazard: " .. part.Name, ORANGE)
+	end
+end
+
+local function setupLearning(char)
+	for _, c in ipairs(charConns) do pcall(function() c:Disconnect() end) end
+	table.clear(charConns)
+	table.clear(touchCount)
+	table.clear(touchStart)
+	if not CONFIG.LearnHazards or not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+	if not hum then return end
+	lastHealth = hum.Health
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("BasePart") then
+			charConns[#charConns + 1] = d.Touched:Connect(function(o)
+				if o:IsDescendantOf(char) then return end
+				touchCount[o] = (touchCount[o] or 0) + 1
+				if touchCount[o] == 1 then touchStart[o] = os.clock() end
+			end)
+			charConns[#charConns + 1] = d.TouchEnded:Connect(function(o)
+				local n = (touchCount[o] or 1) - 1
+				if n <= 0 then
+					touchCount[o], touchStart[o] = nil, nil
+				else
+					touchCount[o] = n
+				end
+			end)
+		end
+	end
+	-- damage / death: blame what we JUST started touching (death counts double, damage needs 2 hits)
+	charConns[#charConns + 1] = hum.HealthChanged:Connect(function(h)
+		local dropped = lastHealth - h
+		lastHealth = h
+		if dropped < 0.5 then return end
+		local now = os.clock()
+		for part, ts in pairs(touchStart) do
+			if now - ts <= 0.6 then blame(part, h <= 0 and 2 or 1) end
+		end
+	end)
+end
+
+---------------------------------------------------------------- lifecycle
+connect(player.CharacterAdded, function(char)
+	rootHCache = nil
+	stop()
+	task.spawn(setupLearning, char)
+end)
+
+local function destroy()
+	active = false
+	searchId += 1
+	follow = nil
+	pcall(function() RunService:UnbindFromRenderStep(BIND) end)
+	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+	for _, c in ipairs(charConns) do pcall(function() c:Disconnect() end) end
+	gui:Destroy()
+	visuals:Destroy()
+	env.__AdvancedPathfinder = nil
+end
+env.__AdvancedPathfinder = destroy
+
+refreshFilter()
+refreshButton()
+if player.Character then task.spawn(setupLearning, player.Character) end
+notify("Advanced Pathfinder by Spvico - tap AP to enable", WHITE)
+print("[Advanced Pathfinder] Created by Spvico")
