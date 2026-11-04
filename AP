@@ -73,6 +73,7 @@ local CONFIG = {
 	HazardThreshold   = 2.5,   -- hazard score needed to treat a part as deadly
 	LearnHazards      = true,  -- learn kill bricks from your deaths / damage
 	AllowHazardGoal   = false, -- allow tapping directly on a hazard
+	HazardClearance   = 1.2,   -- takeoff points keep this far from a hazard's edge (body width)
 
 	IceSupport        = true,  -- ice-aware movement (learned traction, pursuit steering, braking plan)
 	SlipperyFriction  = 0.12,  -- friction below this = ice (Ice 0.02, Glacier 0.05, or custom)
@@ -82,7 +83,6 @@ local CONFIG = {
 	ForbidSlippery    = false, -- true = never use ice at all (off by default)
 
 	VaultEnabled      = true,  -- jump over walls to the ground on the far side
-	MaxWallThickness  = 14,    -- how thick a wall we will try to clear
 	MaxVaultExpansions = 600,
 }
 
@@ -296,7 +296,7 @@ end
 -- There is no universal "kill brick" flag, so each part gets a score from many weak signals:
 --   name / parent names / tags / attributes / child scripts (kill, lava, damage, ...)  +3
 --   learned from your own deaths + damage (exact part, or same colour+material twice)   +5
---   CrackedLava material +2.5, red/orange colour +1.6, TouchInterest +1, Fire child +1, Neon +0.5
+--   red/orange colour +1.6, TouchInterest +1, Fire child +1, CrackedLava +1 (Neon counts for nothing)
 -- score >= HazardThreshold = deadly. "safe / checkpoint / nokill / spawn" names always win.
 local HAZ_WORDS = { "kill", "lava", "death", "deadly", "lethal", "damage", "hurt", "harm", "hazard",
 	"danger", "spike", "trap", "acid", "poison", "toxic", "fatal", "laser", "burn", "zap", "magma" }
@@ -359,11 +359,8 @@ local function computeHazard(part)
 	end
 	local col = part.Color
 	if col.R >= 0.65 and col.G <= 0.45 and col.B <= 0.25 and col.R - col.G >= 0.3 then pts += 1.6 end
-	if part.Material == Enum.Material.CrackedLava then
-		pts += 2.5
-	elseif part.Material == Enum.Material.Neon then
-		pts += 0.5
-	end
+	-- Neon / CrackedLava are used for decoration in most games, so they only add a little (never enough alone)
+	if part.Material == Enum.Material.CrackedLava then pts += 1.0 end
 	return pts >= CONFIG.HazardThreshold
 end
 
@@ -407,7 +404,7 @@ local function hazardAtBody(pos)
 	end
 	local c = bodyCache[k]
 	if c == nil then
-		c = hazardBox(CFrame.new(pos.X, pos.Y + 2.9, pos.Z), V3(2.6, 5.4, 2.6))
+		c = hazardBox(CFrame.new(pos.X, pos.Y + 2.9, pos.Z), V3(2.3, 5.4, 2.3))
 		bodyCache[k] = c
 	end
 	return c
@@ -471,8 +468,16 @@ local function findTakeoff(P, dir, maxLen)
 		if r and r.Normal.Y >= COS_SLOPE and not isHazardHit(r) then
 			lastP = r.Position
 		else
-			local T = lastP - dir * CONFIG.TakeoffInset
+			local inset = CONFIG.TakeoffInset
+			if r and isHazardHit(r) then inset = CONFIG.HazardClearance end -- ledge is a hazard: keep body clear of it
+			local T = lastP - dir * inset
 			if (T - P):Dot(dir) < 0 then T = P end
+			-- still within body reach of something deadly (non-collidable zone, spikes)? back off more
+			local tries = 0
+			while tries < 4 and (T - P):Dot(dir) > 0.4 and hazardAtBody(T) do
+				T = T - dir * 0.5
+				tries += 1
+			end
 			return T
 		end
 		k += 1
@@ -756,34 +761,53 @@ local function rampOK(a, b)
 	return r ~= nil and r.Normal.Y >= COS_SLOPE and math.abs(r.Position.Y - my) < 0.7
 end
 
--- Vault: a wall blocks the way (  _|_  ). Probe the far side column by column, find the first ground
--- past the wall, then find a takeoff point far enough back that the arc (body + LEGS) is above the wall
--- top before it reaches it, and that WalkSpeed * airtime covers the distance to the landing spot.
-local VAULT_RUNUPS = { 1.2, 1.8, 2.5, 3.5, 5, 7 } -- distance from takeoff to the wall face
+-- Vault: a wall blocks the way (  _|_  ). Nothing about the wall is hardcoded: how thick / how tall it may be
+-- comes from THIS player's JumpPower|JumpHeight, gravity and WalkSpeed.
+--   air time      t   = (vy + sqrt(vy^2 - 2*g*dh)) / g          (dh = landing height - takeoff height)
+--   reach         D   <= WalkSpeed * t * ReachSafety             -> the farthest landing we could ever make
+--   max wall      height <= apex of the jump (vy^2 / 2g), thickness <= reach - run-up - landing offset
+-- For every run-up distance b before the wall face we check the arc ANALYTICALLY (feet above the wall top
+-- while we are horizontally over the wall), then confirm with body + leg sweeps.
+local function arcRel(tt) return S.vy * tt - 0.5 * S.g * tt * tt end -- height above takeoff ground after tt seconds
+
+-- farthest horizontal distance this player could ever land from P (deepest possible landing = the void)
+local function reachLimit(P)
+	local depth = math.max(0, math.min(CONFIG.MaxFall, P.Y - (Workspace.FallenPartsDestroyHeight + 15)))
+	local t = flightTime(-depth)
+	return t and S.speed * t * CONFIG.ReachSafety or 0
+end
 
 local function buildVault(node, d)
 	local P = node.pos
 	local wall = sweep(P + V3(0, MID_H, 0), d * 3.4, RADIUS)
 	if not wall then return nil end
 	local face = wall.Distance + RADIUS -- distance from P to the wall face
-	-- anything at apex height in the way = wall taller than we can ever clear
+	-- anything at apex height in the way = wall taller than this player can ever clear
 	if sweep(P + V3(0, S.maxH + 0.2, 0), d * (face + 1.5), 0.5) then return nil end
 
+	local limit = reachLimit(P)
+	local depth = math.max(0, math.min(CONFIG.MaxFall, P.Y - (Workspace.FallenPartsDestroyHeight + 15)))
 	local top0 = P.Y + S.maxH + 1
-	local down = S.maxH + 1 + 40
-	local sFar
+	local down = S.maxH + 1 + depth
+
+	-- walk the columns behind the face until the wall ends; the scan is bounded by REACH, not a constant
+	local sFar, Hw = nil, P.Y
 	local s = face + 0.25
-	while s <= face + CONFIG.MaxWallThickness do
+	while s - face <= limit do
 		local q = P + d * s
 		local hit = raycast(V3(q.X, top0, q.Z), V3(0, -down, 0))
 		if not hit then return nil end -- void beyond
-		if hit.Position.Y <= P.Y + CONFIG.StepUp then
+		local y = hit.Position.Y
+		if y > P.Y + CONFIG.StepUp then
+			Hw = math.max(Hw, y)
+		else
 			if hit.Normal.Y >= COS_SLOPE and not isHazardHit(hit) then sFar = s end
 			break
 		end
-		s += 0.5
+		s += (s - face < 8) and 0.5 or 1.0
 	end
 	if not sFar then return nil end
+	local thick = sFar - face
 
 	-- landing a bit past the wall's far face
 	local L, Linst
@@ -798,24 +822,33 @@ local function buildVault(node, d)
 	end
 	if not L then return nil end
 
-	for _, b in ipairs(VAULT_RUNUPS) do
+	-- run-up search: shortest run-up that clears the wall; stop as soon as the jump would be too long to reach
+	local Hrel = Hw - P.Y
+	local b = 1.2
+	while true do
 		local T0 = P + d * (face - b)
 		local tr = raycast(V3(T0.X, P.Y + 1.2, T0.Z), V3(0, -2.6, 0))
-		if tr and tr.Normal.Y >= COS_SLOPE and not isHazardHit(tr) and math.abs(tr.Position.Y - P.Y) < 1.2 then
+		if not (tr and tr.Normal.Y >= COS_SLOPE and not isHazardHit(tr) and math.abs(tr.Position.Y - P.Y) < 1.2) then
+			if b > face + 0.5 then break end -- ran out of floor behind us
+		else
 			local T = tr.Position
 			local t = flightTime(L.Y - T.Y)
-			if t then
-				local D = flatDist(L, T)
-				if D <= S.speed * t * CONFIG.ReachSafety - 0.25
-					and (face - b >= 0 or pathClear(P, T, RADIUS))
-					and arcClear(T, L, t, true, 8) then
-					return {
-						kind = "jump", vault = true, pos = L, inst = Linst, takeoff = T,
-						cost = flatDist(P, T) + D + CONFIG.JumpPenalty + 2,
-					}
-				end
+			if not t then break end
+			local D = flatDist(L, T)
+			if D > S.speed * t * CONFIG.ReachSafety - 0.25 then break end -- longer run-up = longer jump: impossible from here on
+			local u = D / t -- horizontal speed we need along the arc
+			local x0, x1 = math.max(0, b - 0.5), b + thick + 0.5
+			if arcRel(x0 / u) >= Hrel + 0.3 and arcRel(x1 / u) >= Hrel + 0.3
+				and not hazardAtBody(T)
+				and (face - b >= 0 or pathClear(P, T, RADIUS))
+				and arcClear(T, L, t, true, 8) then
+				return {
+					kind = "jump", vault = true, pos = L, inst = Linst, takeoff = T,
+					cost = flatDist(P, T) + D + CONFIG.JumpPenalty + 2,
+				}
 			end
 		end
+		b += 0.6
 	end
 	return nil
 end
@@ -834,6 +867,73 @@ local function expandVaults(node, out, dirs)
 	end
 end
 
+-- Hop: a hazard strip (lava stripe, kill bar) lies across the floor. It is often the SAME part as the floor,
+-- so part-based landing candidates never see the far side. Scan the line instead: find the strip, the first
+-- safe ground behind it, take off a body-width before it and land a body-width after it.
+local function buildHop(node, d)
+	local P = node.pos
+	local sNear, sFar
+	local s = 0.25
+	local limit = reachLimit(P) -- widest strip is whatever this player's jump can span
+	while s <= limit do
+		local q = P + d * s
+		local hit = raycast(V3(q.X, P.Y + 2.2, q.Z), V3(0, -5.5, 0))
+		if hit and isHazardHit(hit) then
+			sNear = sNear or s
+		elseif sNear then
+			if hit and hit.Normal.Y >= COS_SLOPE and math.abs(hit.Position.Y - P.Y) <= CONFIG.StepUp then sFar = s end
+			break
+		elseif not hit then
+			return nil -- void before any hazard: that's a gap, not a strip
+		end
+		s += 0.25
+	end
+	if not sNear or not sFar then return nil end
+
+	local L, Linst
+	for _, extra in ipairs({ 1.0, 1.6, 2.4 }) do
+		local q = P + d * (sFar + extra)
+		local hit = raycast(V3(q.X, P.Y + 2.2, q.Z), V3(0, -5.5, 0))
+		if hit and hit.Normal.Y >= COS_LAND and not isHazardHit(hit) and math.abs(hit.Position.Y - P.Y) <= CONFIG.StepUp
+			and not hazardAtBody(hit.Position) then
+			L, Linst = hit.Position, hit.Instance
+			break
+		end
+	end
+	if not L then return nil end
+
+	local T = P
+	local T0 = P + d * (sNear - CONFIG.HazardClearance)
+	local tr = raycast(V3(T0.X, P.Y + 1.2, T0.Z), V3(0, -2.6, 0))
+	if tr and tr.Normal.Y >= COS_SLOPE and not isHazardHit(tr) and math.abs(tr.Position.Y - P.Y) < 1.2 then
+		T = tr.Position
+	end
+	if T ~= P and not pathClear(P, T, RADIUS) then return nil end
+	local t = flightTime(L.Y - T.Y)
+	if not t then return nil end
+	local D = flatDist(L, T)
+	if D > S.speed * t * CONFIG.ReachSafety - 0.25 then return nil end
+	if not arcClear(T, L, t, true, 8) then return nil end
+	return {
+		kind = "jump", vault = true, pos = L, inst = Linst, takeoff = T,
+		cost = flatDist(P, T) + D + CONFIG.JumpPenalty + 1,
+	}
+end
+
+local function expandHops(node, out, dirs)
+	if S.vyReal < 10 or S.speed < 1 then return end
+	local gd = flat(goalPos - node.pos)
+	for _, d in ipairs(dirs) do
+		if vaultExpansions >= CONFIG.MaxVaultExpansions then return end
+		if gd.Magnitude < 1 or d:Dot(gd.Unit) > -0.05 then
+			vaultExpansions += 1
+			local e = buildHop(node, d)
+			if e then out[#out + 1] = e end
+			checkYield()
+		end
+	end
+end
+
 -- returns pos, inst, cost, isDrop   |   nil, reason ("gap" / "block")
 local function tryWalk(a, tx, tz)
 	local ay = a.Y
@@ -842,7 +942,7 @@ local function tryWalk(a, tx, tz)
 	if down <= su then return nil, "gap" end
 	local r = raycast(V3(tx, ay + su + 0.3, tz), V3(0, -down, 0))
 	if r and r.Normal.Y >= COS_SLOPE then
-		if isHazardHit(r) then return nil, "gap" end -- lava / kill brick = not floor, jump over it
+		if isHazardHit(r) then return nil, "hazard" end -- lava / kill brick = not floor, hop over it
 		local slip = isSlipperyHit(r)
 		if slip and CONFIG.ForbidSlippery then return nil, "gap" end
 		local b = r.Position
@@ -855,7 +955,7 @@ local function tryWalk(a, tx, tz)
 			q = V3(b.X, ay, b.Z) -- walk off the ledge, then fall
 			drop = true
 		end
-		if ok and pathClear(a, q, RADIUS) and not hazardAtBody(b) then
+		if ok and pathClear(a, q, RADIUS) and not hazardAtBody(b) and not hazardAtBody((a + b) / 2) then
 			local cost = flatDist(a, b) + (drop and (2 + math.abs(dy) * 0.05) or math.abs(dy) * 0.3)
 			if slip then
 				cost += CONFIG.SlipPenalty
@@ -879,7 +979,7 @@ end
 local function expandWalk(node, out)
 	local p = node.pos
 	local gaps, blocks = 0, 0
-	local bdirs = {}
+	local bdirs, hdirs = {}, {}
 	for i = 1, 8 do
 		local o = OFFSETS[i]
 		local b, inst, cost, drop = tryWalk(p, p.X + o[1] * CELL, p.Z + o[2] * CELL)
@@ -888,12 +988,15 @@ local function expandWalk(node, out)
 			if drop then gaps += 1 end
 		elseif inst == "gap" then
 			gaps += 1
+		elseif inst == "hazard" then
+			gaps += 1
+			hdirs[#hdirs + 1] = V3(o[1], 0, o[2]).Unit
 		else
 			blocks += 1
 			bdirs[#bdirs + 1] = V3(o[1], 0, o[2]).Unit
 		end
 	end
-	return gaps, blocks, bdirs
+	return gaps, blocks, bdirs, hdirs
 end
 
 ---------------------------------------------------------------- A*
@@ -986,7 +1089,7 @@ local function findPath(startPos, startInst, goal, weight)
 			if count >= CONFIG.MaxNodes then break end
 
 			table.clear(out)
-			local gaps, blocks, bdirs = expandWalk(n, out)
+			local gaps, blocks, bdirs, hdirs = expandWalk(n, out)
 			if n.landing or gaps >= 2 then
 				expandJumps(n, out, false)
 			elseif gaps + blocks >= 3 then
@@ -1000,6 +1103,9 @@ local function findPath(startPos, startInst, goal, weight)
 			end
 			if CONFIG.VaultEnabled and #bdirs > 0 then
 				expandVaults(n, out, bdirs)
+			end
+			if CONFIG.VaultEnabled and #hdirs > 0 then
+				expandHops(n, out, hdirs)
 			end
 
 			for _, e in ipairs(out) do
@@ -1200,12 +1306,12 @@ local function replan(f, reason, free)
 		if f.reroutes >= CONFIG.MaxReroutes then
 			stop("Too many deviations", RED)
 		else
-			startSearch(f.goal, { replans = f.replans, reroutes = f.reroutes + 1, quiet = true, holds = f.holds })
+			startSearch(f.goal, { replans = f.replans, reroutes = f.reroutes + 1, quiet = true, holds = f.holds, hz = f.hz })
 		end
 	elseif f.replans >= CONFIG.MaxReplans then
 		stop("Path failed (" .. reason .. ")", RED)
 	else
-		startSearch(f.goal, { replans = f.replans + 1, reroutes = f.reroutes, quiet = true, holds = f.holds })
+		startSearch(f.goal, { replans = f.replans + 1, reroutes = f.reroutes, quiet = true, holds = f.holds, hz = f.hz })
 	end
 end
 
@@ -1273,7 +1379,7 @@ startSearch = function(goal, opts)
 			if #steps == 0 then return end
 			follow = {
 				steps = steps, i = 1, prev = startPos, goal = goal, partial = not complete,
-				replans = opts.replans or 0, reroutes = opts.reroutes or 0, holds = opts.holds or 0,
+				replans = opts.replans or 0, reroutes = opts.reroutes or 0, holds = opts.holds or 0, hz = opts.hz or 0,
 				lastPos = root.Position, lastT = os.clock(), stuck = 0,
 			}
 			drawPath(steps)
@@ -1462,7 +1568,7 @@ local function onStep(dt)
 				local dl = dv.Magnitude
 				if dl > 0.3 then
 					local ahead = feet + (dv / dl) * math.min(dl, math.max(1.5, speed * 0.3))
-					if hazardBox(CFrame.new(ahead.X, ahead.Y + 2.9, ahead.Z), V3(2, 4.6, 2)) then f.hzAhead = ahead end
+					if hazardBox(CFrame.new(ahead.X, ahead.Y + 2.9, ahead.Z), V3(1.6, 4.6, 1.6)) then f.hzAhead = ahead end
 				end
 			end
 			if f.hzAhead then
@@ -1472,6 +1578,8 @@ local function onStep(dt)
 				if os.clock() - f.hzWait > 1.2 then
 					tempBlocked[cellKey(f.hzAhead)] = os.clock() + 4
 					f.hzWait, f.hzAhead = nil, nil
+					f.hz = (f.hz or 0) + 1
+					if f.hz >= 4 then stop("Hazard in the way - stopped", RED) return end
 					replan(f, "hazard ahead", true)
 				end
 				return
