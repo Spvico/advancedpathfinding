@@ -24,6 +24,7 @@ local RunService       = game:GetService("RunService")
 local Workspace        = game:GetService("Workspace")
 local CollectionService = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
+local GuiService = game:GetService("GuiService")
 
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
@@ -1975,6 +1976,27 @@ end)
 ---------------------------------------------------------------- toggle button (tap / hold-drag)
 local BIND = "AdvancedPathfinderStep"
 local pressInput, pressT, dragMode, dragStartPtr, dragStartPos
+local dragStartUDim
+
+-- Pointer in the SAME space as AbsolutePosition (full-screen GUI space). Touch input.Position excludes the
+-- top inset, GetMouseLocation includes it.
+local function guiPointer(input)
+	if input.UserInputType == Enum.UserInputType.Touch then
+		local inset = GuiService:GetGuiInset()
+		return Vector2.new(input.Position.X + inset.X, input.Position.Y + inset.Y)
+	end
+	return UserInputService:GetMouseLocation()
+end
+
+-- GUI hit boxes are rectangles even with UICorner, so the button's square corners would react to a press
+-- that is clearly outside the visible circle. Only accept presses inside the circle.
+local function insideCircle(input)
+	local center = button.AbsolutePosition + button.AbsoluteSize / 2
+	local r = button.AbsoluteSize.X / 2
+	local d = (guiPointer(input) - center).Magnitude
+	if d > r * 1.6 then return true end -- coordinates don't line up on this device: never lock the button
+	return d <= r
+end
 
 local function refreshButton()
 	button.BackgroundColor3 = dragMode and DRAG_COLOR or (active and ON_COLOR or OFF_COLOR)
@@ -2006,13 +2028,14 @@ connect(button.InputBegan, function(input)
 	if pressInput then return end
 	local t = input.UserInputType
 	if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
+	if not insideCircle(input) then return end
 	pressInput, pressT, dragMode = input, os.clock(), false
 	local mine = input
 	task.delay(CONFIG.HoldTime, function()
 		if pressInput == mine and not dragMode then
 			dragMode = true
 			dragStartPtr = pointer(mine)
-			dragStartPos = button.AbsolutePosition + button.AbsoluteSize / 2
+			dragStartUDim = button.Position -- drag RELATIVE to where it is: no absolute-position conversion, no jump
 			refreshButton()
 		end
 	end)
@@ -2023,12 +2046,14 @@ connect(UserInputService.InputChanged, function(input)
 	local t = input.UserInputType
 	if (t == Enum.UserInputType.Touch and input == pressInput)
 		or (t == Enum.UserInputType.MouseMovement and pressInput.UserInputType == Enum.UserInputType.MouseButton1) then
-		local p = dragStartPos + (pointer(pressInput) - dragStartPtr)
-		local sz, half = gui.AbsoluteSize, button.AbsoluteSize / 2
-		button.Position = UDim2.fromOffset(
-			math.clamp(p.X, half.X, math.max(half.X, sz.X - half.X)),
-			math.clamp(p.Y, half.Y, math.max(half.Y, sz.Y - half.Y))
-		)
+		local dlt = pointer(pressInput) - dragStartPtr
+		local W, H = gui.AbsoluteSize.X, gui.AbsoluteSize.Y
+		local half = button.AbsoluteSize / 2
+		local sx, sy = dragStartUDim.X, dragStartUDim.Y
+		-- centre in pixels (button is anchored at its centre), clamped so it stays on screen
+		local cx = math.clamp(sx.Scale * W + sx.Offset + dlt.X, half.X, math.max(half.X, W - half.X))
+		local cy = math.clamp(sy.Scale * H + sy.Offset + dlt.Y, half.Y, math.max(half.Y, H - half.Y))
+		button.Position = UDim2.new(sx.Scale, cx - sx.Scale * W, sy.Scale, cy - sy.Scale * H)
 	end
 end)
 
