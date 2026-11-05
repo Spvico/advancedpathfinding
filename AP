@@ -23,6 +23,7 @@ local UserInputService = game:GetService("UserInputService")
 local RunService       = game:GetService("RunService")
 local Workspace        = game:GetService("Workspace")
 local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
@@ -84,6 +85,11 @@ local CONFIG = {
 
 	VaultEnabled      = true,  -- jump over walls to the ground on the far side
 	MaxVaultExpansions = 600,
+
+	ShowHazards       = true,  -- outline in red what it believes is deadly
+	LearnFromOthers   = true,  -- learn kill bricks from other players dying / getting hurt
+	PersistHazards    = true,  -- remember learned + marked hazards per game (needs an executor with writefile)
+	LongPressTime     = 0.7,   -- hold on any part this long to toggle it deadly <-> safe
 }
 
 ---------------------------------------------------------------- constants / helpers
@@ -134,6 +140,8 @@ local retryId, searchingId = 0, 0
 local fallExpansions = 0
 local brakeUntil = 0
 local vaultExpansions = 0
+local hazRejects = 0
+local lastHazardPart = nil
 local S = { g = 196.2, vy = 50, vyReal = 50, speed = 16, rootH = 3, maxH = 6.4, iceAccel = 10 }
 local CANCEL = {}
 
@@ -173,11 +181,12 @@ end
 local toast = Instance.new("TextLabel")
 toast.AnchorPoint = Vector2.new(0.5, 0)
 toast.Position = UDim2.new(0.5, 0, 0, 64)
-toast.Size = UDim2.fromOffset(300, 34)
+toast.Size = UDim2.fromOffset(340, 44)
 toast.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
 toast.BackgroundTransparency = 0.25
 toast.Font = Enum.Font.GothamMedium
-toast.TextSize = 16
+toast.TextSize = 15
+toast.TextWrapped = true
 toast.TextColor3 = WHITE
 toast.Visible = false
 toast.Parent = gui
@@ -226,6 +235,11 @@ hazardOverlap.FilterType = Enum.RaycastFilterType.Exclude
 hazardOverlap.RespectCanCollide = false
 hazardOverlap.MaxParts = 60
 
+local markParams = RaycastParams.new()
+markParams.FilterType = Enum.RaycastFilterType.Exclude
+markParams.IgnoreWater = true
+markParams.RespectCanCollide = false
+
 local function refreshFilter()
 	local list = { visuals }
 	for _, p in ipairs(Players:GetPlayers()) do
@@ -234,6 +248,7 @@ local function refreshFilter()
 	worldParams.FilterDescendantsInstances = list
 	overlapParams.FilterDescendantsInstances = list
 	hazardOverlap.FilterDescendantsInstances = list
+	markParams.FilterDescendantsInstances = list
 end
 
 local function raycast(o, d) return Workspace:Raycast(o, d, worldParams) end
@@ -293,41 +308,115 @@ local function checkYield()
 end
 
 ---------------------------------------------------------------- hazards (kill bricks)
--- There is no universal "kill brick" flag, so each part gets a score from many weak signals:
---   name / parent names / tags / attributes / child scripts (kill, lava, damage, ...)  +3
---   learned from your own deaths + damage (exact part, or same colour+material twice)   +5
---   red/orange colour +1.6, TouchInterest +1, Fire child +1, CrackedLava +1 (Neon counts for nothing)
--- score >= HazardThreshold = deadly. "safe / checkpoint / nokill / spawn" names always win.
-local HAZ_WORDS = { "kill", "lava", "death", "deadly", "lethal", "damage", "hurt", "harm", "hazard",
+-- There is no universal "kill brick" flag, so every part gets a score from many weak signals, and the
+-- score is then CORRECTED by what actually happens (corrections beat guessing):
+--   names (part + parents), tags, attributes, child scripts     strong words +3, weak words +1.6
+--   TouchInterest +1, Fire child +1, red/orange colour +1.6, CrackedLava +1, repeated thin touch bars +0.8
+--   CanTouch = false  -2 (can't fire Touched, so it can't be a touch-kill)
+--   "safe / checkpoint / spawn / heal / deco" names always win
+-- Corrections:
+--   HOLD a part on screen = toggle deadly <-> safe (remembered per game when the executor has writefile)
+--   you die / get hurt right after touching something new = that part is blamed
+--   other players dying / getting hurt where they just arrived = blamed (needs 2 deaths)
+--   the same colour + material blamed twice = that look is deadly
+-- Detected hazards get a red outline (ShowHazards) so you can SEE what it believes.
+local HAZ_STRONG = { "kill", "lava", "death", "deadly", "lethal", "damage", "dmg", "hurt", "harm", "hazard",
 	"danger", "spike", "trap", "acid", "poison", "toxic", "fatal", "laser", "burn", "zap", "magma" }
-local SAFE_WORDS = { "safe", "nokill", "antikill", "nodamage", "checkpoint", "spawn", "heal" }
+local HAZ_WEAK = { "fire", "saw", "blade", "shock", "electr", "explo", "bomb", "dead", "pain", "oof", "thorn", "flame" }
+local SAFE_WORDS = { "safe", "nokill", "antikill", "nodamage", "checkpoint", "spawn", "heal", "deco" }
 
 local learned = env.__APLearned or setmetatable({}, { __mode = "k" }) -- part -> blame points
 env.__APLearned = learned
 local sigHaz = env.__APSigs or {}                                     -- colour+material -> #parts blamed
 env.__APSigs = sigHaz
+local manual = setmetatable({}, { __mode = "k" })                     -- part -> true (deadly) / false (safe)
 local hazardCache = setmetatable({}, { __mode = "k" })
 local tempBlocked = {}
 local bodyCache = {}
+local hazardChangedHook = nil
+
+-- ---- persistence (executor file, per game)
+local saved = { haz = {}, safe = {} }
+local SAVE_FILE = "AdvancedPathfinder_" .. tostring(game.PlaceId) .. ".json"
+do
+	if CONFIG.PersistHazards and isfile and readfile then
+		local ok, data = pcall(function()
+			if isfile(SAVE_FILE) then return HttpService:JSONDecode(readfile(SAVE_FILE)) end
+		end)
+		if ok and type(data) == "table" then
+			saved.haz = type(data.haz) == "table" and data.haz or {}
+			saved.safe = type(data.safe) == "table" and data.safe or {}
+		end
+	end
+end
+local saveQueued = false
+local function persist()
+	if not (CONFIG.PersistHazards and writefile) or saveQueued then return end
+	saveQueued = true
+	task.delay(1.5, function()
+		saveQueued = false
+		pcall(function() writefile(SAVE_FILE, HttpService:JSONEncode(saved)) end)
+	end)
+end
+
+-- ---- red outline on detected hazards
+local hazardMarks = Instance.new("Folder")
+hazardMarks.Name = "AP_Hazards"
+hazardMarks.Parent = Workspace.Terrain
+local marks, markCount = {}, 0
+local function setMark(part, on)
+	if not CONFIG.ShowHazards then return end
+	local m = marks[part]
+	if on and not m and markCount < 80 then
+		local box = Instance.new("SelectionBox")
+		box.Adornee = part
+		box.Color3 = Color3.fromRGB(255, 70, 70)
+		box.LineThickness = 0.04
+		box.SurfaceColor3 = Color3.fromRGB(255, 70, 70)
+		box.SurfaceTransparency = 0.8
+		box.Parent = hazardMarks
+		marks[part] = box
+		markCount += 1
+	elseif not on and m then
+		m:Destroy()
+		marks[part] = nil
+		markCount -= 1
+	end
+end
 
 local function textScore(str)
 	str = string.lower(str)
+	if string.find(str, "unsafe", 1, true) then return 3 end
 	for _, w in ipairs(SAFE_WORDS) do
 		if string.find(str, w, 1, true) then return -4 end
 	end
-	for _, w in ipairs(HAZ_WORDS) do
+	for _, w in ipairs(HAZ_STRONG) do
 		if string.find(str, w, 1, true) then return 3 end
+	end
+	for _, w in ipairs(HAZ_WEAK) do
+		if string.find(str, w, 1, true) then return 1.6 end
 	end
 	return 0
 end
 
-local function signature(part)
+local function signature(part) -- colour + material (generalises to "all parts that look like this")
 	local c = part.Color
 	if math.max(c.R, c.G, c.B) - math.min(c.R, c.G, c.B) < 0.25 then return nil end -- grey/white: too generic
 	return string.format("%d,%d,%d,%s", math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255), part.Material.Name)
 end
 
+local function sigKey(part) -- name + size + colour + material (identifies "this kind of part" across servers)
+	local c, sz = part.Color, part.Size
+	return string.format("%s|%.1f,%.1f,%.1f|%d,%d,%d|%s", part.Name, sz.X, sz.Y, sz.Z,
+		math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255), part.Material.Name)
+end
+
 local function computeHazard(part)
+	local m = manual[part]
+	if m ~= nil then return m end
+	local key = sigKey(part)
+	if saved.safe[key] then return false end
+	if saved.haz[key] then return true end
 	if (learned[part] or 0) >= 2 then return true end
 	local sig = signature(part)
 	if sig and (sigHaz[sig] or 0) >= 2 then return true end
@@ -344,22 +433,44 @@ local function computeHazard(part)
 		inst, depth = inst.Parent, depth + 1
 	end
 	for _, tag in ipairs(CollectionService:GetTags(part)) do
-		if textScore(tag) > 0 then pts += 3 break end
+		local sc = textScore(tag)
+		if sc > 0 then pts += sc break end
 	end
 	for k, v in pairs(part:GetAttributes()) do
 		if textScore(k) > 0 and (v == true or (type(v) == "number" and v > 0)) then pts += 3 break end
 	end
+	local hasTouch = false
 	for _, c in ipairs(part:GetChildren()) do
 		local cn = c.ClassName
-		if cn == "TouchTransmitter" or cn == "Fire" then
+		if cn == "TouchTransmitter" then
+			hasTouch = true
 			pts += 1
-		elseif cn ~= "Decal" and cn ~= "Texture" and textScore(c.Name) > 0 then
-			pts += 3
+		elseif cn == "Fire" then
+			pts += 1
+		elseif cn ~= "Decal" and cn ~= "Texture" then
+			local sc = textScore(c.Name)
+			if sc > 0 then pts += sc end
 		end
 	end
+	if not part.CanTouch then pts -= 2 end
+
+	-- a row of identical thin touch-enabled bars across a path is the classic obstacle layout
+	local sz = part.Size
+	if hasTouch and math.min(sz.X, sz.Y, sz.Z) <= 2.5 and part.Parent and part.Parent ~= Workspace then
+		local same = 0
+		for _, sib in ipairs(part.Parent:GetChildren()) do
+			if sib ~= part and sib:IsA("BasePart") and sib.Material == part.Material and sib.Color == part.Color
+				and (sib.Size - sz).Magnitude < 0.3 then
+				same += 1
+				if same >= 2 then break end
+			end
+		end
+		if same >= 2 then pts += 0.8 end
+	end
+
 	local col = part.Color
 	if col.R >= 0.65 and col.G <= 0.45 and col.B <= 0.25 and col.R - col.G >= 0.3 then pts += 1.6 end
-	-- Neon / CrackedLava are used for decoration in most games, so they only add a little (never enough alone)
+	-- Neon / CrackedLava are decoration in most games: weak, never enough alone
 	if part.Material == Enum.Material.CrackedLava then pts += 1.0 end
 	return pts >= CONFIG.HazardThreshold
 end
@@ -371,6 +482,7 @@ local function hazardPart(part)
 		local ok, res = pcall(computeHazard, part)
 		c = ok and res or false
 		hazardCache[part] = c
+		if c then setMark(part, true) end
 	end
 	return c
 end
@@ -384,7 +496,10 @@ end
 local function hazardBox(cf, size)
 	if not CONFIG.AvoidHazards then return false end
 	for _, p in ipairs(Workspace:GetPartBoundsInBox(cf, size, hazardOverlap)) do
-		if p.ClassName ~= "Terrain" and hazardPart(p) then return true end
+		if p.ClassName ~= "Terrain" and hazardPart(p) then
+			lastHazardPart = p
+			return true
+		end
 	end
 	return false
 end
@@ -408,6 +523,21 @@ local function hazardAtBody(pos)
 		bodyCache[k] = c
 	end
 	return c
+end
+
+-- hold on a part: flip what we believe about it (deadly <-> safe) and remember it
+local function toggleHazard(part)
+	local now = not hazardPart(part)
+	manual[part] = now
+	local key = sigKey(part)
+	saved.haz[key] = now or nil
+	saved.safe[key] = (not now) or nil
+	hazardCache = setmetatable({}, { __mode = "k" })
+	bodyCache = {}
+	persist()
+	setMark(part, now)
+	notify((now and "Marked DEADLY: " or "Marked safe: ") .. part.Name, now and RED or GREEN)
+	if hazardChangedHook then hazardChangedHook() end
 end
 
 ---------------------------------------------------------------- slippery surfaces
@@ -777,6 +907,20 @@ local function reachLimit(P)
 	return t and S.speed * t * CONFIG.ReachSafety or 0
 end
 
+-- how far behind the takeoff point we start running: 1.4 normally, longer on ice (slow acceleration)
+local function pickRunup(node, T, d)
+	local ru = 1.4
+	if node.inst and CONFIG.IceSupport and isSlipperyPart(node.inst) then
+		ru = math.clamp(S.speed * S.speed / (2 * S.iceAccel) * 0.8, 1.4, 9)
+	end
+	if ru > 1.4 then
+		local R0 = T - d * ru
+		local rr = raycast(V3(R0.X, T.Y + 1.2, R0.Z), V3(0, -2.6, 0))
+		if not (rr and rr.Normal.Y >= COS_SLOPE and not isHazardHit(rr)) then ru = 1.4 end
+	end
+	return ru
+end
+
 local function buildVault(node, d)
 	local P = node.pos
 	local wall = sweep(P + V3(0, MID_H, 0), d * 3.4, RADIUS)
@@ -844,7 +988,7 @@ local function buildVault(node, d)
 				and arcClear(T, L, t, true, 8) then
 				return {
 					kind = "jump", vault = true, pos = L, inst = Linst, takeoff = T,
-					cost = flatDist(P, T) + D + CONFIG.JumpPenalty + 2,
+					cost = flatDist(P, T) + D + CONFIG.JumpPenalty + 2, runup = pickRunup(node, T, d),
 				}
 			end
 		end
@@ -886,7 +1030,8 @@ local function buildHop(node, d)
 		elseif not hit then
 			return nil -- void before any hazard: that's a gap, not a strip
 		end
-		s += 0.25
+		if not sNear and s > 4.5 then return nil end -- the hazard that rejected this step is within a step or two
+		s += 0.4
 	end
 	if not sNear or not sFar then return nil end
 
@@ -916,7 +1061,7 @@ local function buildHop(node, d)
 	if not arcClear(T, L, t, true, 8) then return nil end
 	return {
 		kind = "jump", vault = true, pos = L, inst = Linst, takeoff = T,
-		cost = flatDist(P, T) + D + CONFIG.JumpPenalty + 1,
+		cost = flatDist(P, T) + D + CONFIG.JumpPenalty + 1, runup = pickRunup(node, T, d),
 	}
 end
 
@@ -942,7 +1087,11 @@ local function tryWalk(a, tx, tz)
 	if down <= su then return nil, "gap" end
 	local r = raycast(V3(tx, ay + su + 0.3, tz), V3(0, -down, 0))
 	if r and r.Normal.Y >= COS_SLOPE then
-		if isHazardHit(r) then return nil, "hazard" end -- lava / kill brick = not floor, hop over it
+		if isHazardHit(r) then
+			hazRejects += 1
+			lastHazardPart = r.Instance
+			return nil, "hazard" -- lava / kill brick = not floor, hop over it
+		end
 		local slip = isSlipperyHit(r)
 		if slip and CONFIG.ForbidSlippery then return nil, "gap" end
 		local b = r.Position
@@ -955,7 +1104,11 @@ local function tryWalk(a, tx, tz)
 			q = V3(b.X, ay, b.Z) -- walk off the ledge, then fall
 			drop = true
 		end
-		if ok and pathClear(a, q, RADIUS) and not hazardAtBody(b) and not hazardAtBody((a + b) / 2) then
+		if ok and pathClear(a, q, RADIUS) then
+			if hazardAtBody(b) or hazardAtBody((a + b) / 2) then
+				hazRejects += 1
+				return nil, "hazard" -- the step is fine except a hazard sits in it: let the hop logic try to clear it
+			end
 			local cost = flatDist(a, b) + (drop and (2 + math.abs(dy) * 0.05) or math.abs(dy) * 0.3)
 			if slip then
 				cost += CONFIG.SlipPenalty
@@ -1064,6 +1217,8 @@ local function findPath(startPos, startInst, goal, weight)
 	faceCache = {}
 	climbChecks = 0
 	bodyCache = {}
+	hazRejects = 0
+	lastHazardPart = nil
 	local s = getNode(startPos, startInst)
 	s.g = 0
 	s.landing = true
@@ -1169,7 +1324,7 @@ local function buildSteps(endNode, goal, complete, startPos)
 			steps[#steps + 1] = {
 				kind = "jump", takeoff = e.takeoff, land = e.pos,
 				dir = d.Magnitude > 0.01 and d.Unit or V3(0, 0, 1),
-				lip = (e.pos.Y - e.takeoff.Y) > CONFIG.StepUp, vault = e.vault,
+				lip = (e.pos.Y - e.takeoff.Y) > CONFIG.StepUp, vault = e.vault, runup = e.runup,
 			}
 		elseif e.drop then
 			-- walk off a ledge and fall (any depth): handled like a jump with no jump, steered to the landing
@@ -1352,7 +1507,14 @@ startSearch = function(goal, opts)
 
 			if not complete then
 				if endNode.parent == nil then
-					if not opts.retry then notify("No path - staying put", RED) end
+					if not opts.retry then
+						if hazRejects > 0 then
+							notify("Blocked by hazard" .. (lastHazardPart and (" (" .. lastHazardPart.Name .. ")") or "")
+								.. " - hold it to mark safe", RED)
+						else
+							notify("No path - staying put", RED)
+						end
+					end
 					return
 				end
 				-- The first search is weighted toward the unreachable goal, so its route to the fallback
@@ -1649,10 +1811,11 @@ local function onStep(dt)
 			local along = toT:Dot(step.dir)
 			local retreat = false
 			if step.vault and not step.ready then
-				if along >= 0.8 then step.ready = true else retreat = true end
+				if along >= (step.runup or 1.4) - 0.6 then step.ready = true else retreat = true end
 			end
 			if retreat then
-				local R = V3(T.X - step.dir.X * 1.4 - feet.X, 0, T.Z - step.dir.Z * 1.4 - feet.Z)
+				local ru = step.runup or 1.4
+				local R = V3(T.X - step.dir.X * ru - feet.X, 0, T.Z - step.dir.Z * ru - feet.Z)
 				hum:Move((R.Magnitude > 0.05) and R.Unit or Vector3.zero, false)
 			elseif slip then
 				iceRunSteer(hum, root, toT, d, step.dir, speed)
@@ -1773,13 +1936,30 @@ local function onWorldTap(ray)
 	startSearch(res.Position, {})
 end
 
+local function onWorldHold(ray)
+	refreshFilter()
+	local res = Workspace:Raycast(ray.Origin, ray.Direction * 2000, markParams)
+	if not res or not res.Instance or res.Instance:IsA("Terrain") then
+		notify("Nothing to mark there", ORANGE)
+		return
+	end
+	toggleHazard(res.Instance)
+end
+
 local pending = {}
 connect(UserInputService.InputBegan, function(input, gp)
 	if gp or not active then return end
 	local t = input.UserInputType
 	if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
 	local key = (t == Enum.UserInputType.Touch) and input or "mouse"
-	pending[key] = { t = os.clock(), start = pointer(input), ray = rayFrom(input) }
+	local rec = { t = os.clock(), start = pointer(input), ray = rayFrom(input) }
+	pending[key] = rec
+	task.delay(CONFIG.LongPressTime, function()
+		if pending[key] == rec and not rec.done and (pointer(input) - rec.start).Magnitude <= CONFIG.TapMove then
+			rec.done = true
+			onWorldHold(rec.ray)
+		end
+	end)
 end)
 connect(UserInputService.InputEnded, function(input)
 	local t = input.UserInputType
@@ -1787,7 +1967,7 @@ connect(UserInputService.InputEnded, function(input)
 	local p = key and pending[key]
 	if not p then return end
 	pending[key] = nil
-	if active and os.clock() - p.t <= CONFIG.TapTime and (pointer(input) - p.start).Magnitude <= CONFIG.TapMove then
+	if active and not p.done and os.clock() - p.t <= CONFIG.TapTime and (pointer(input) - p.start).Magnitude <= CONFIG.TapMove then
 		onWorldTap(p.ray)
 	end
 end)
@@ -1807,7 +1987,7 @@ local function setActive(v)
 	refreshButton()
 	if v then
 		RunService:BindToRenderStep(BIND, Enum.RenderPriority.Last.Value, onStep) -- after the default controls
-		notify("Advanced Pathfinder ON - tap a spot", GREEN)
+		notify("ON - tap a spot (hold a part to mark deadly / safe)", GREEN)
 	else
 		pcall(function() RunService:UnbindFromRenderStep(BIND) end)
 		stop()
@@ -1875,6 +2055,8 @@ local function blame(part, w)
 	if before < 2 and learned[part] >= 2 then
 		local sig = signature(part)
 		if sig then sigHaz[sig] = (sigHaz[sig] or 0) + 1 end
+		saved.haz[sigKey(part)] = true
+		persist()
 		notify("Learned hazard: " .. part.Name, ORANGE)
 	end
 end
@@ -1917,6 +2099,81 @@ local function setupLearning(char)
 	end)
 end
 
+---------------------------------------------------------------- learning from other players
+-- Players near us are watched: when one gets hurt / dies, the parts that appeared around their body in the
+-- last half second (new contact, not the floor they were already on) are blamed. Two deaths = deadly.
+local alive = true
+local othersHist = setmetatable({}, { __mode = "k" })
+local otherConns = {}
+
+local function isCharPart(p)
+	local m = p.Parent
+	for _ = 1, 3 do
+		if not m then return false end
+		if m:FindFirstChildOfClass("Humanoid") then return true end
+		m = m.Parent
+	end
+	return false
+end
+
+local function bodySet(root)
+	local set = {}
+	for _, p in ipairs(Workspace:GetPartBoundsInBox(CFrame.new(root.Position), V3(2.6, 5.2, 2.6), hazardOverlap)) do
+		if p.ClassName ~= "Terrain" and not isCharPart(p) then set[p] = true end
+	end
+	return set
+end
+
+local function trackOthers()
+	while alive do
+		task.wait(0.25)
+		if CONFIG.LearnFromOthers and CONFIG.LearnHazards then
+			local _, _, myRoot = getChar()
+			if myRoot then
+				local list = {}
+				for _, pl in ipairs(Players:GetPlayers()) do
+					local h = pl ~= player and pl.Character and pl.Character:FindFirstChildOfClass("Humanoid")
+					local r = h and h.RootPart
+					if h and r and h.Health > 0 then
+						local d = (r.Position - myRoot.Position).Magnitude
+						if d < 250 then list[#list + 1] = { h = h, r = r, d = d } end
+					end
+				end
+				table.sort(list, function(a, b) return a.d < b.d end)
+				for i = 1, math.min(6, #list) do
+					local h, r = list[i].h, list[i].r
+					local rec = othersHist[h]
+					if not rec then
+						rec = { ring = {}, hp = h.Health }
+						othersHist[h] = rec
+						otherConns[#otherConns + 1] = h.HealthChanged:Connect(function(hp)
+							local dropped = rec.hp - hp
+							rec.hp = hp
+							if dropped < 0.5 or #rec.ring == 0 then return end
+							local now = os.clock()
+							local newest = rec.ring[#rec.ring].set
+							local old
+							for j = #rec.ring, 1, -1 do
+								if now - rec.ring[j].t >= 0.5 then
+									old = rec.ring[j].set
+									break
+								end
+							end
+							for part in pairs(newest) do
+								if not (old and old[part]) then blame(part, hp <= 0 and 1 or 0.5) end
+							end
+						end)
+					end
+					local ring = rec.ring
+					ring[#ring + 1] = { t = os.clock(), set = bodySet(r) }
+					if #ring > 6 then table.remove(ring, 1) end
+				end
+			end
+		end
+	end
+end
+task.spawn(trackOthers)
+
 ---------------------------------------------------------------- lifecycle
 connect(player.CharacterAdded, function(char)
 	rootHCache = nil
@@ -1924,7 +2181,14 @@ connect(player.CharacterAdded, function(char)
 	task.spawn(setupLearning, char)
 end)
 
+hazardChangedHook = function()
+	-- a hazard flag changed (long-press): re-plan the current route with the new belief
+	if follow then startSearch(follow.goal, { quiet = true, retry = true, holds = follow.holds }) end
+end
+
 local function destroy()
+	alive = false
+	for _, c in ipairs(otherConns) do pcall(function() c:Disconnect() end) end
 	active = false
 	searchId += 1
 	follow = nil
@@ -1933,6 +2197,7 @@ local function destroy()
 	for _, c in ipairs(charConns) do pcall(function() c:Disconnect() end) end
 	gui:Destroy()
 	visuals:Destroy()
+	hazardMarks:Destroy()
 	env.__AdvancedPathfinder = nil
 end
 env.__AdvancedPathfinder = destroy
