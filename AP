@@ -90,7 +90,6 @@ local CONFIG = {
 	ShowHazards       = true,  -- outline in red what it believes is deadly
 	LearnFromOthers   = true,  -- learn kill bricks from other players dying / getting hurt
 	PersistHazards    = true,  -- remember learned + marked hazards per game (needs an executor with writefile)
-	LongPressTime     = 0.7,   -- hold on any part this long to toggle it deadly <-> safe
 }
 
 ---------------------------------------------------------------- constants / helpers
@@ -236,11 +235,6 @@ hazardOverlap.FilterType = Enum.RaycastFilterType.Exclude
 hazardOverlap.RespectCanCollide = false
 hazardOverlap.MaxParts = 60
 
-local markParams = RaycastParams.new()
-markParams.FilterType = Enum.RaycastFilterType.Exclude
-markParams.IgnoreWater = true
-markParams.RespectCanCollide = false
-
 local function refreshFilter()
 	local list = { visuals }
 	for _, p in ipairs(Players:GetPlayers()) do
@@ -249,7 +243,6 @@ local function refreshFilter()
 	worldParams.FilterDescendantsInstances = list
 	overlapParams.FilterDescendantsInstances = list
 	hazardOverlap.FilterDescendantsInstances = list
-	markParams.FilterDescendantsInstances = list
 end
 
 local function raycast(o, d) return Workspace:Raycast(o, d, worldParams) end
@@ -316,11 +309,11 @@ end
 --   CanTouch = false  -2 (can't fire Touched, so it can't be a touch-kill)
 --   "safe / checkpoint / spawn / heal / deco" names always win
 -- Corrections:
---   HOLD a part on screen = toggle deadly <-> safe (remembered per game when the executor has writefile)
 --   you die / get hurt right after touching something new = that part is blamed
 --   other players dying / getting hurt where they just arrived = blamed (needs 2 deaths)
 --   the same colour + material blamed twice = that look is deadly
--- Detected hazards get a red outline (ShowHazards) so you can SEE what it believes.
+--   a "hazard" you stand on / touch for 3 s without taking damage = false alarm, cleared automatically
+-- Everything is automatic: no marking, no setup. Detected hazards get a red outline (ShowHazards).
 local HAZ_STRONG = { "kill", "lava", "death", "deadly", "lethal", "damage", "dmg", "hurt", "harm", "hazard",
 	"danger", "spike", "trap", "acid", "poison", "toxic", "fatal", "laser", "burn", "zap", "magma" }
 local HAZ_WEAK = { "fire", "saw", "blade", "shock", "electr", "explo", "bomb", "dead", "pain", "oof", "thorn", "flame" }
@@ -330,11 +323,10 @@ local learned = env.__APLearned or setmetatable({}, { __mode = "k" }) -- part ->
 env.__APLearned = learned
 local sigHaz = env.__APSigs or {}                                     -- colour+material -> #parts blamed
 env.__APSigs = sigHaz
-local manual = setmetatable({}, { __mode = "k" })                     -- part -> true (deadly) / false (safe)
+local manual = setmetatable({}, { __mode = "k" })                     -- part -> false = proven safe (auto-corrected)
 local hazardCache = setmetatable({}, { __mode = "k" })
 local tempBlocked = {}
 local bodyCache = {}
-local hazardChangedHook = nil
 
 -- ---- persistence (executor file, per game)
 local saved = { haz = {}, safe = {} }
@@ -524,21 +516,6 @@ local function hazardAtBody(pos)
 		bodyCache[k] = c
 	end
 	return c
-end
-
--- hold on a part: flip what we believe about it (deadly <-> safe) and remember it
-local function toggleHazard(part)
-	local now = not hazardPart(part)
-	manual[part] = now
-	local key = sigKey(part)
-	saved.haz[key] = now or nil
-	saved.safe[key] = (not now) or nil
-	hazardCache = setmetatable({}, { __mode = "k" })
-	bodyCache = {}
-	persist()
-	setMark(part, now)
-	notify((now and "Marked DEADLY: " or "Marked safe: ") .. part.Name, now and RED or GREEN)
-	if hazardChangedHook then hazardChangedHook() end
 end
 
 ---------------------------------------------------------------- slippery surfaces
@@ -1511,7 +1488,7 @@ startSearch = function(goal, opts)
 					if not opts.retry then
 						if hazRejects > 0 then
 							notify("Blocked by hazard" .. (lastHazardPart and (" (" .. lastHazardPart.Name .. ")") or "")
-								.. " - hold it to mark safe", RED)
+								.. " - no safe way over or around", RED)
 						else
 							notify("No path - staying put", RED)
 						end
@@ -1937,30 +1914,13 @@ local function onWorldTap(ray)
 	startSearch(res.Position, {})
 end
 
-local function onWorldHold(ray)
-	refreshFilter()
-	local res = Workspace:Raycast(ray.Origin, ray.Direction * 2000, markParams)
-	if not res or not res.Instance or res.Instance:IsA("Terrain") then
-		notify("Nothing to mark there", ORANGE)
-		return
-	end
-	toggleHazard(res.Instance)
-end
-
 local pending = {}
 connect(UserInputService.InputBegan, function(input, gp)
 	if gp or not active then return end
 	local t = input.UserInputType
 	if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
 	local key = (t == Enum.UserInputType.Touch) and input or "mouse"
-	local rec = { t = os.clock(), start = pointer(input), ray = rayFrom(input) }
-	pending[key] = rec
-	task.delay(CONFIG.LongPressTime, function()
-		if pending[key] == rec and not rec.done and (pointer(input) - rec.start).Magnitude <= CONFIG.TapMove then
-			rec.done = true
-			onWorldHold(rec.ray)
-		end
-	end)
+	pending[key] = { t = os.clock(), start = pointer(input), ray = rayFrom(input) }
 end)
 connect(UserInputService.InputEnded, function(input)
 	local t = input.UserInputType
@@ -1968,7 +1928,7 @@ connect(UserInputService.InputEnded, function(input)
 	local p = key and pending[key]
 	if not p then return end
 	pending[key] = nil
-	if active and not p.done and os.clock() - p.t <= CONFIG.TapTime and (pointer(input) - p.start).Magnitude <= CONFIG.TapMove then
+	if active and os.clock() - p.t <= CONFIG.TapTime and (pointer(input) - p.start).Magnitude <= CONFIG.TapMove then
 		onWorldTap(p.ray)
 	end
 end)
@@ -2009,7 +1969,7 @@ local function setActive(v)
 	refreshButton()
 	if v then
 		RunService:BindToRenderStep(BIND, Enum.RenderPriority.Last.Value, onStep) -- after the default controls
-		notify("ON - tap a spot (hold a part to mark deadly / safe)", GREEN)
+		notify("Advanced Pathfinder ON - tap a spot", GREEN)
 	else
 		pcall(function() RunService:UnbindFromRenderStep(BIND) end)
 		stop()
@@ -2068,6 +2028,7 @@ end)
 ---------------------------------------------------------------- learning kill bricks
 local touchCount, touchStart, charConns = {}, {}, {}
 local lastHealth = 0
+local lastDamageAt = 0
 
 local function blame(part, w)
 	if not part or not part.Parent then return end
@@ -2118,6 +2079,7 @@ local function setupLearning(char)
 		lastHealth = h
 		if dropped < 0.5 then return end
 		local now = os.clock()
+		lastDamageAt = now
 		for part, ts in pairs(touchStart) do
 			if now - ts <= 0.6 then blame(part, h <= 0 and 2 or 1) end
 		end
@@ -2128,6 +2090,33 @@ end
 -- Players near us are watched: when one gets hurt / dies, the parts that appeared around their body in the
 -- last half second (new contact, not the floor they were already on) are blamed. Two deaths = deadly.
 local alive = true
+
+-- Automatic correction of false alarms: if we have been touching a part believed deadly for 3 s and took no
+-- damage since the contact began, it is NOT deadly (also fixes a wrongly blamed floor). Remembered per game.
+local function clearFalseHazard(part)
+	manual[part] = false
+	learned[part] = nil
+	local key = sigKey(part)
+	saved.haz[key] = nil
+	saved.safe[key] = true
+	hazardCache = setmetatable({}, { __mode = "k" })
+	bodyCache = {}
+	persist()
+	setMark(part, false)
+end
+
+task.spawn(function()
+	while alive do
+		task.wait(0.5)
+		local now = os.clock()
+		for part, ts in pairs(touchStart) do
+			if now - ts > 3 and lastDamageAt < ts and part.Parent and hazardPart(part) then
+				clearFalseHazard(part)
+			end
+		end
+	end
+end)
+
 local othersHist = setmetatable({}, { __mode = "k" })
 local otherConns = {}
 
@@ -2205,11 +2194,6 @@ connect(player.CharacterAdded, function(char)
 	stop()
 	task.spawn(setupLearning, char)
 end)
-
-hazardChangedHook = function()
-	-- a hazard flag changed (long-press): re-plan the current route with the new belief
-	if follow then startSearch(follow.goal, { quiet = true, retry = true, holds = follow.holds }) end
-end
 
 local function destroy()
 	alive = false
