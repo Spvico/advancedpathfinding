@@ -127,6 +127,11 @@ local function heur(p, g)
 	return math.sqrt(dx * dx + dz * dz) + (dy > 0 and dy or -dy * 0.05)
 end
 
+local function objPos(obj) -- position of a Part or a Model
+	if obj:IsA("Model") then return obj:GetPivot().Position end
+	return obj.Position
+end
+
 ---------------------------------------------------------------- state
 local active = false
 local follow = nil
@@ -308,7 +313,8 @@ end
 -- There is no universal "kill brick" flag, so every part gets a score from many weak signals, and the
 -- score is then CORRECTED by what actually happens (corrections beat guessing):
 --   names (part + parents), tags, attributes, child scripts     strong words +3, weak words +1.6
---   TouchInterest +1, Fire child +1, red/orange colour +1.6, Neon +1, CrackedLava +1, repeated thin touch bars +0.8
+--   TouchInterest +1, Fire child +1, red/orange colour +1.6, Neon +1, repeated thin touch bars +0.8,
+--   touch-enabled but NON-collidable (kill zone / laser) +1.5
 --   CanTouch = false  -2 (can't fire Touched, so it can't be a touch-kill)
 --   "safe / checkpoint / spawn / heal / deco" names always win
 -- Corrections:
@@ -466,9 +472,9 @@ local function computeHazard(part)
 
 	local col = part.Color
 	if col.R >= 0.65 and col.G <= 0.45 and col.B <= 0.25 and col.R - col.G >= 0.3 then pts += 1.6 end
-	-- materials games use for danger: weak alone, they add up with the other signals
+	-- Neon is weak alone, it adds up with the other signals
 	if part.Material == Enum.Material.Neon then pts += 1.0 end
-	if part.Material == Enum.Material.CrackedLava then pts += 1.0 end
+	if hasTouch and not part.CanCollide then pts += 1.5 end -- zones / lasers: touch-enabled but you pass through
 	return pts >= CONFIG.HazardThreshold
 end
 
@@ -486,7 +492,7 @@ end
 
 local function isHazardHit(res)
 	if not CONFIG.AvoidHazards or not res or not res.Instance then return false end
-	if res.Instance:IsA("Terrain") then return res.Material == Enum.Material.CrackedLava end
+	if res.Instance:IsA("Terrain") then return false end -- terrain is never a hazard by material
 	return hazardPart(res.Instance)
 end
 
@@ -629,18 +635,34 @@ local function findTakeoff(P, dir, maxLen)
 end
 
 -- body-sized sweeps along the predicted arc
-local function arcClear(T, L, t, legs, steps)
+local function arcClear(T, L, t, legs, steps, via)
 	local N = steps or 5
+	local len1, total = 0, 0
+	if via then
+		len1 = flatDist(via, T)
+		total = len1 + flatDist(L, via)
+	end
 	local lip = (L.Y - T.Y > CONFIG.StepUp) and L.Y or nil
 	local prev
 	for i = 0, N do
 		local s = i / N
 		local tt = t * s
-		local p = V3(
-			T.X + (L.X - T.X) * s,
-			T.Y + S.rootH + S.vy * tt - 0.5 * S.g * tt * tt,
-			T.Z + (L.Z - T.Z) * s
-		)
+		local px, pz
+		if via and total > 1e-4 then
+			-- horizontal path T -> via -> L at uniform speed (time fraction = path fraction)
+			local dist = s * total
+			if dist <= len1 then
+				local f = (len1 > 1e-4) and dist / len1 or 0
+				px, pz = T.X + (via.X - T.X) * f, T.Z + (via.Z - T.Z) * f
+			else
+				local l2 = total - len1
+				local f = (l2 > 1e-4) and (dist - len1) / l2 or 1
+				px, pz = via.X + (L.X - via.X) * f, via.Z + (L.Z - via.Z) * f
+			end
+		else
+			px, pz = T.X + (L.X - T.X) * s, T.Z + (L.Z - T.Z) * s
+		end
+		local p = V3(px, T.Y + S.rootH + S.vy * tt - 0.5 * S.g * tt * tt, pz)
 		if i >= 1 and i < N and hazardBox(CFrame.new(p), V3(2.2, 4.8, 2.2)) then return false end
 		if prev and (not lip or (prev.Y - S.rootH) >= lip - 0.5) then
 			local d = p - prev
@@ -655,6 +677,8 @@ end
 local LERPS = { 0, 0.3, 0.6, 1 }
 local faceCache = {}
 local climbChecks = 0
+local climbSeen = {}
+local badLadders = setmetatable({}, { __mode = "k" })
 
 -- Top walkable face of a part. Works for blocks in ANY orientation, and for cylinders
 -- (a Roblox cylinder's round face is on its local X axis, so a flat disk is "rotated").
@@ -723,8 +747,10 @@ end
 local function arcRel(tt) return S.vy * tt - 0.5 * S.g * tt * tt end -- height above takeoff ground after tt seconds
 
 local FAN = { 0, 0.4, -0.4, 0.8, -0.8 } -- takeoff search directions around the straight line to the landing (rad)
+local CURVE_OFFS = { 2.2, 3.6, 5.4, 7.5 }   -- how far the arch swings out sideways (studs)
+local CURVE_FRACS = { 0.5, 0.3, 0.7 }       -- where along the straight line the swing is widest
 
-local function buildJump(node, face, pt, m)
+local function buildJump(node, face, pt, m, allowCurve)
 	local P = node.pos
 	local r = snapLanding(face, pt)
 	if not r then return nil end
@@ -735,13 +761,16 @@ local function buildJump(node, face, pt, m)
 	if fd < 0.2 then return nil end
 	local dir = fv / fd
 	local mEff = math.min(m or CONFIG.LandMargin, face.circle and face.r or math.min(face.hu, face.hv))
+	local slipPen = isSlipperyHit(r) and CONFIG.SlipPenalty or 0
+	local Ts = {}
 
-	-- the straight line P -> L can run into a wall or miss the ledge: try a fan of takeoff directions
+	-- 1. straight jumps: the straight line P -> L can run into a wall or miss the ledge, so try a fan of takeoffs
 	for _, ang in ipairs(FAN) do
 		local c, sn = math.cos(ang), math.sin(ang)
 		local dd = V3(dir.X * c - dir.Z * sn, 0, dir.X * sn + dir.Z * c)
 		local T = findTakeoff(P, dd, math.min(fd + 2, CONFIG.EdgeScan))
 		if T then
+			Ts[#Ts + 1] = T
 			local dh = L.Y - T.Y
 			local t = flightTime(dh)
 			if t then
@@ -750,14 +779,51 @@ local function buildJump(node, face, pt, m)
 					local ok = true
 					if dh > CONFIG.StepUp then
 						-- going UP: our feet must be above the landing's lip when the body reaches its edge
-						local u = hd / t
-						ok = arcRel(math.max(0, hd - mEff - 0.5) / u) >= dh + 0.1
+						ok = arcRel(math.max(0, hd - mEff - 0.5) / (hd / t)) >= dh + 0.1
 					end
 					if ok and arcClear(T, L, t) then
 						return {
 							kind = "jump", pos = L, inst = r.Instance, takeoff = T,
-							cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + (isSlipperyHit(r) and CONFIG.SlipPenalty or 0),
+							cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + slipPen,
 						}
+					end
+				end
+			end
+		end
+	end
+	if not allowCurve then return nil end
+
+	-- 2. arch jumps: a wall / pillar sits on the straight line but you can steer in mid-air, so swing out
+	--    around its side (path T -> W -> L). The horizontal path is longer, so reach is checked on its LENGTH.
+	for i = 1, math.min(#Ts, 3) do
+		local T = Ts[i]
+		local dh = L.Y - T.Y
+		local t = flightTime(dh)
+		if t then
+			local tv = V3(L.X - T.X, 0, L.Z - T.Z)
+			local hd = tv.Magnitude
+			if hd >= 1.0 then
+				local fwd = tv / hd
+				local perp = V3(-fwd.Z, 0, fwd.X)
+				local maxLen = S.speed * t * CONFIG.ReachSafety - 0.2
+				for _, off in ipairs(CURVE_OFFS) do
+					for _, frac in ipairs(CURVE_FRACS) do
+						for _, side in ipairs({ 1, -1 }) do
+							local W = T + fwd * (hd * frac) + perp * (off * side)
+							local plen = flatDist(T, W) + flatDist(W, L)
+							if plen <= maxLen then
+								local ok = true
+								if dh > CONFIG.StepUp then
+									ok = arcRel(math.max(0, plen - mEff - 0.5) / (plen / t)) >= dh + 0.1
+								end
+								if ok and arcClear(T, L, t, true, 8, W) then
+									return {
+										kind = "jump", pos = L, inst = r.Instance, takeoff = T, via = W,
+										cost = flatDist(P, T) + plen + CONFIG.JumpPenalty + 3 + slipPen,
+									}
+								end
+							end
+						end
 					end
 				end
 			end
@@ -804,39 +870,90 @@ local function expandJumps(node, out, climbOnly)
 	end
 	table.sort(cands, function(a, b) return a.score < b.score end)
 	for i = 1, math.min(#cands, CONFIG.MaxJumpCandidates) do
-		local e = buildJump(node, cands[i].face, cands[i].pt, CONFIG.LandMargin)
-		if not e then e = buildJump(node, cands[i].face, cands[i].pt2, 0.7) end
+		local e = buildJump(node, cands[i].face, cands[i].pt, CONFIG.LandMargin, i <= 3)
+		if not e then e = buildJump(node, cands[i].face, cands[i].pt2, 0.7, i <= 3) end
 		if e then out[#out + 1] = e end
 		checkYield()
 	end
 end
 
--- truss / ladder edges: climb up to a ledge near the top, or down to the ground near the bottom
+-- Ladders / climbables:
+--   * TrussPart (collidable or not)
+--   * CUSTOM ladders: a part or model (up to 3 parents up) named / tagged / attributed "ladder", "climb", "vine".
+--     We don't know how those are scripted, so we push into them and keep jumping, and WATCH the height: if we
+--     are not gaining height they are marked bad for a while and we re-plan (rung ladders are also reachable
+--     through the normal jump logic, custom climbs cost more so real jump paths win).
+local LADDER_WORDS = { "ladder", "climb", "vine" }
+local function ladderWord(str)
+	str = string.lower(str)
+	for _, w in ipairs(LADDER_WORDS) do
+		if string.find(str, w, 1, true) then return true end
+	end
+	return false
+end
+
+local function ladderOf(part)
+	if part.ClassName == "TrussPart" then return part, "truss" end
+	local inst, depth = part, 0
+	while inst and inst ~= Workspace and depth < 4 do
+		if inst:IsA("Model") or inst:IsA("BasePart") then
+			if ladderWord(inst.Name) then return inst, "custom" end
+			for _, tag in ipairs(CollectionService:GetTags(inst)) do
+				if ladderWord(tag) then return inst, "custom" end
+			end
+			for k, v in pairs(inst:GetAttributes()) do
+				if ladderWord(k) and v then return inst, "custom" end
+			end
+		end
+		inst, depth = inst.Parent, depth + 1
+	end
+	return nil
+end
+
+local function objBox(obj)
+	if obj:IsA("Model") then
+		local ok, cf, size = pcall(function() return obj:GetBoundingBox() end)
+		if ok then return cf, size end
+		return nil
+	end
+	return obj.CFrame, obj.Size
+end
+
 local function expandClimbs(node, out)
 	if climbChecks >= CONFIG.MaxClimbChecks then return end
-	climbChecks += 1
 	local P = node.pos
-	local parts = Workspace:GetPartBoundsInRadius(P, 5, overlapParams)
+	-- one scan per 3-stud cell is plenty (landing nodes always scan)
+	local ck = (math.floor(P.X / 3) * 100003 + math.floor(P.Z / 3)) * 4001 + math.floor(P.Y / 3)
+	if climbSeen[ck] and not node.landing then return end
+	climbSeen[ck] = true
+	climbChecks += 1
+	local parts = Workspace:GetPartBoundsInRadius(P, 5, hazardOverlap) -- also sees non-collidable ladders
+	local seen = {}
 	for _, part in ipairs(parts) do
-		if part.ClassName == "TrussPart" then
-			local cf, size = part.CFrame, part.Size
-			if math.abs(cf.UpVector.Y) >= 0.8 then
+		local obj, kind = ladderOf(part)
+		if obj and not seen[obj] and (badLadders[obj] or 0) < os.clock() then
+			seen[obj] = true
+			local cf, size = objBox(obj)
+			if cf then
 				local ext = 0.5 * (size.Y * math.abs(cf.UpVector.Y)
 					+ size.X * math.abs(cf.RightVector.Y) + size.Z * math.abs(cf.LookVector.Y))
 				local c = cf.Position
 				local topY, botY = c.Y + ext, c.Y - ext
 				local hw = math.max(size.X, size.Z) * 0.5
-				if flatDist(P, c) - hw <= 3.2 then
+				local okShape = (kind == "truss" and math.abs(cf.UpVector.Y) >= 0.8)
+					or (kind == "custom" and topY - botY >= 5 and hw <= 7)
+				if okShape and flatDist(P, c) - hw <= 3.2 then
 					for _, up in ipairs({ true, false }) do
 						local can = (up and (P.Y <= botY + 4 and topY - P.Y >= 3))
 							or (not up and (P.Y >= topY - 4 and P.Y - botY >= 3))
 						if can then
 							local best
-							for a = 0, 7 do
-								local ang = a * math.pi / 4
+							for a2 = 0, 7 do
+								local ang = a2 * math.pi / 4
 								local x, z = c.X + math.cos(ang) * (hw + 2), c.Z + math.sin(ang) * (hw + 2)
 								local r = raycast(V3(x, up and (topY + 2.5) or (botY + 4), z), V3(0, -7, 0))
-								if r and r.Instance ~= part and r.Normal.Y >= COS_LAND and not isHazardHit(r) then
+								if r and r.Instance ~= obj and not r.Instance:IsDescendantOf(obj)
+									and r.Normal.Y >= COS_LAND and not isHazardHit(r) then
 									local ey = r.Position.Y
 									local ok = (up and (ey >= P.Y + 3 and ey <= topY + 1.2))
 										or (not up and (ey <= P.Y - 3 and ey >= botY - 3))
@@ -848,10 +965,12 @@ local function expandClimbs(node, out)
 							end
 							if best then
 								local E = best.r.Position
+								local custom = kind == "custom"
 								out[#out + 1] = {
-									kind = "climb", pos = E, inst = best.r.Instance, truss = part,
+									kind = "climb", pos = E, inst = best.r.Instance, truss = obj,
 									topY = topY, botY = botY, up = up, from = P,
-									cost = math.abs(E.Y - P.Y) * 0.8 + flatDist(P, E) + 3,
+									custom = custom, reach = hw + 1.8,
+									cost = math.abs(E.Y - P.Y) * (custom and 1.6 or 0.8) + flatDist(P, E) + (custom and 8 or 3),
 								}
 							end
 						end
@@ -1286,6 +1405,7 @@ local function findPath(startPos, startInst, goal, weight)
 
 	faceCache = {}
 	climbChecks = 0
+	climbSeen = {}
 	bodyCache = {}
 	hazRejects = 0
 	lastHazardPart = nil
@@ -1323,7 +1443,7 @@ local function findPath(startPos, startInst, goal, weight)
 			if (n.landing or gaps >= 2) and goal.Y < n.pos.Y - 4 then
 				expandFalls(n, out) -- target is lower: consider dropping off ledges (reach counted per sample)
 			end
-			if CONFIG.ClimbEnabled and (blocks >= 1 or n.landing) then
+			if CONFIG.ClimbEnabled then
 				expandClimbs(n, out)
 			end
 			if CONFIG.VaultEnabled and #bdirs > 0 then
@@ -1384,17 +1504,18 @@ local function buildSteps(endNode, goal, complete, startPos)
 	for i = 2, #chain do
 		local e = chain[i].edge
 		if e.kind == "climb" then
-			local fd = flat(e.truss.Position - e.from)
+			local fd = flat(objPos(e.truss) - e.from)
 			steps[#steps + 1] = {
 				kind = "climb", truss = e.truss, exit = e.pos, topY = e.topY, botY = e.botY, up = e.up,
+				custom = e.custom, reach = e.reach,
 				dir = fd.Magnitude > 0.01 and fd.Unit or V3(0, 0, 1),
 			}
 		elseif e.kind == "jump" then
-			local d = flat(e.pos - e.takeoff)
+			local d = flat((e.via or e.pos) - e.takeoff)
 			steps[#steps + 1] = {
 				kind = "jump", takeoff = e.takeoff, land = e.pos,
 				dir = d.Magnitude > 0.01 and d.Unit or V3(0, 0, 1),
-				lip = (e.pos.Y - e.takeoff.Y) > CONFIG.StepUp, vault = e.vault, runup = e.runup,
+				lip = (e.pos.Y - e.takeoff.Y) > CONFIG.StepUp, vault = e.vault, runup = e.runup, via = e.via,
 			}
 		elseif e.drop then
 			-- walk off a ledge and fall (any depth): handled like a jump with no jump, steered to the landing
@@ -1822,21 +1943,25 @@ local function onStep(dt)
 
 	if step.kind == "climb" then
 		local truss, E = step.truss, step.exit
-		if not truss or not truss.Parent then replan(f, "truss gone") return end
+		if not truss or not truss.Parent then replan(f, "ladder gone") return end
 		if not step.phase then step.phase, step.t0 = "approach", os.clock() end
-		local tc = truss.Position
+		local tc = objPos(truss)
 		local into = V3(tc.X - feet.X, 0, tc.Z - feet.Z)
 		local il = into.Magnitude
 		local intoDir = (il > 0.05) and into / il or step.dir
 		local climbing = hum:GetState() == Enum.HumanoidStateType.Climbing
 		local elapsed = os.clock() - step.t0
+		local custom = step.custom
 
 		if step.phase == "approach" then
-			hum:Move(intoDir, false) -- walk into the truss, the Humanoid grabs it on contact
-			if climbing then
+			hum:Move(intoDir, false) -- walk into it; a truss grabs us on contact
+			if climbing or (custom and il <= (step.reach or 3)) then
 				step.phase, step.t0 = "climb", os.clock()
+				step.bestP = step.up and feet.Y or -feet.Y
+				step.lastGain = os.clock()
 			elseif elapsed > 4 then
-				replan(f, "couldn't reach truss") return
+				if custom then badLadders[truss] = os.clock() + 90 end
+				replan(f, "couldn't reach ladder") return
 			end
 		else
 			local toE = V3(E.X - feet.X, 0, E.Z - feet.Z)
@@ -1844,17 +1969,27 @@ local function onStep(dt)
 			local toEDir = (tl > 0.05) and toE / tl or intoDir
 			local mv
 			if step.up then
-				-- push into the truss to climb up; near the top head for the ledge
-				mv = (feet.Y < step.topY - 1.2) and intoDir or toEDir
+				mv = (feet.Y < step.topY - 1.2) and intoDir or toEDir -- push in to climb, near the top head for the ledge
 			else
-				mv = (climbing and feet.Y > E.Y + 1.5) and -intoDir or toEDir
+				mv = ((climbing or custom) and feet.Y > E.Y + 1.5) and -intoDir or toEDir
 			end
 			hum:Move(mv, false)
+			if custom then
+				if step.up and feet.Y < step.topY - 1.2 and os.clock() - (step.lastJump or 0) > 0.3 then
+					hum.Jump = true -- custom ladders often need jumps to latch / push upward
+					step.lastJump = os.clock()
+				end
+				local pnow = step.up and feet.Y or -feet.Y
+				if pnow > (step.bestP or pnow) + 0.15 then step.bestP, step.lastGain = pnow, os.clock() end
+			end
 			if grounded and not climbing and elapsed > 0.3 and math.abs(feet.Y - E.Y) <= 2 and tl <= 6 then
 				f.prev = E
 				f.i += 1
-			elseif elapsed > 15 or (grounded and not climbing and elapsed > 1.2 and math.abs(feet.Y - E.Y) > 3) then
-				replan(f, "lost the truss") return
+			elseif custom and os.clock() - (step.lastGain or os.clock()) > 2.2 and math.abs(feet.Y - E.Y) > 2 then
+				badLadders[truss] = os.clock() + 90 -- not climbing: don't try this one again for a while
+				replan(f, "ladder didn't work") return
+			elseif elapsed > 15 or (not custom and grounded and not climbing and elapsed > 1.2 and math.abs(feet.Y - E.Y) > 3) then
+				replan(f, "lost the ladder") return
 			end
 		end
 	elseif step.kind == "jump" then
@@ -1897,7 +2032,8 @@ local function onStep(dt)
 			if not retreat and grounded and along <= math.max(0.2, hs * dt * 1.25) then
 				-- re-check with the REAL position: if we got shoved off the takeoff line, don't jump short
 				local tNow = flightTime(L.Y - feet.Y)
-				if not tNow or flatDist(feet, L) > speed * tNow * 0.98 then
+				local plen = step.via and (flatDist(feet, step.via) + flatDist(step.via, L)) or flatDist(feet, L)
+				if not tNow or plen > speed * tNow * 0.98 then
 					replan(f, "off the takeoff line", true) return
 				end
 				doJump(hum)
@@ -1937,8 +2073,21 @@ local function onStep(dt)
 				local h = (L.Y + rootH) - pos.Y
 				local disc = vy * vy - 2 * g * h
 				local t = (disc >= 0) and (vy + math.sqrt(disc)) / g or math.max(vy / g, 0)
-				local rem = V3(L.X - pos.X, 0, L.Z - pos.Z)
-				local rd = rem.Magnitude
+				-- arch jump: steer to the swing waypoint first, then to the landing (path length drives the throttle)
+				local tgt, extra = L, 0
+				if step.via and not step.viaDone then
+					local Vw = step.via
+					local toV = V3(Vw.X - pos.X, 0, Vw.Z - pos.Z)
+					local passed = ((pos.X - Vw.X) * (L.X - Vw.X) + (pos.Z - Vw.Z) * (L.Z - Vw.Z)) > 0
+					if toV.Magnitude < 1.2 or passed then
+						step.viaDone = true
+					else
+						tgt, extra = Vw, flatDist(Vw, L)
+					end
+				end
+				local rem = V3(tgt.X - pos.X, 0, tgt.Z - pos.Z)
+				local rdDir = rem.Magnitude
+				local rd = rdDir + extra
 				local throttle
 				if rd < 0.12 then
 					throttle = 0
@@ -1948,7 +2097,7 @@ local function onStep(dt)
 					throttle = 1
 				end
 				if step.lip and feet.Y < L.Y - 0.3 then throttle = math.max(throttle, 0.6) end
-				local mv = (rd > 0.05) and (rem / rd) or step.dir
+				local mv = (rdDir > 0.05) and (rem / rdDir) or step.dir
 				hum:Move(mv * throttle, false)
 				if CONFIG.VelocityAssist then
 					local v = mv * throttle * speed
@@ -2131,9 +2280,27 @@ connect(UserInputService.InputEnded, function(input)
 end)
 
 ---------------------------------------------------------------- learning kill bricks
+-- Blame has to land on the KILLER, not on the platform we happen to be standing on. A kill brick without
+-- collision still "touches" us, and the platform under our feet is also recent contact, so:
+--   * damage shows up about one network round trip AFTER the contact: only contacts of that age are suspects
+--   * parts that SUPPORTED us (ground under the feet) are blamed only when nothing else is new
+--   * non-collidable parts (zones, lasers) are more suspicious than collidable ones
+--   * we also test what overlapped our body where we were one round trip ago (exact shape test), which finds
+--     non-collidable kill zones even if no Touched event fired
 local touchCount, touchStart, charConns = {}, {}, {}
 local lastHealth = 0
 local lastDamageAt = 0
+local supportHist, posHist = {}, {} -- sampled ~10 Hz: {t, inst} / {t, pos}
+
+local function isCharPart(p)
+	local m = p.Parent
+	for _ = 1, 3 do
+		if not m then return false end
+		if m:FindFirstChildOfClass("Humanoid") then return true end
+		m = m.Parent
+	end
+	return false
+end
 
 local function blame(part, w)
 	if not part or not part.Parent then return end
@@ -2152,11 +2319,76 @@ local function blame(part, w)
 	end
 end
 
+-- cands: array of { part = ... }; support: set of parts that held us up. Returns suspects, floorOnly
+local function pickCulprits(cands, support)
+	local others, floors = {}, {}
+	for _, c in ipairs(cands) do
+		if support[c.part] then floors[#floors + 1] = c else others[#others + 1] = c end
+	end
+	if #others > 0 then return others, false end
+	return floors, true
+end
+
+local function onOwnDamage(h)
+	local now = os.clock()
+	local okp, ping = pcall(function() return player:GetNetworkPing() end)
+	local rtt = math.clamp((okp and ping or 0.08) * 2, 0.06, 0.8)
+
+	-- 1. contacts whose age matches the damage delay
+	local cands, seen = {}, {}
+	local bestErr = math.huge
+	for part, ts in pairs(touchStart) do
+		local age = now - ts
+		if age <= rtt + 0.45 then
+			local err = math.abs(age - rtt)
+			cands[#cands + 1] = { part = part, err = err }
+			bestErr = math.min(bestErr, err)
+			seen[part] = true
+		end
+	end
+	local suspects = {}
+	for _, c in ipairs(cands) do
+		if c.err <= bestErr + 0.2 then suspects[#suspects + 1] = c end
+	end
+
+	-- 2. what overlapped our body one round trip ago (exact shape), non-collidable zones included
+	local past
+	for i = #posHist, 1, -1 do
+		if now - posHist[i].t >= rtt then
+			past = posHist[i].pos
+			break
+		end
+	end
+	if past then
+		local bcf, bsize = CFrame.new(past), V3(2.6, 5.2, 2.6)
+		for _, part in ipairs(Workspace:GetPartBoundsInBox(bcf, bsize, hazardOverlap)) do
+			if part.ClassName ~= "Terrain" and not seen[part] and not isCharPart(part)
+				and obbOverlap(bcf, bsize, part.CFrame, part.Size) then
+				seen[part] = true
+				suspects[#suspects + 1] = { part = part, err = 0 }
+			end
+		end
+	end
+
+	local support = {}
+	for _, e in ipairs(supportHist) do
+		if e.inst and now - e.t <= rtt + 1.0 then support[e.inst] = true end
+	end
+	local list, floorOnly = pickCulprits(suspects, support)
+	local base = (h <= 0) and 2 or 1
+	for _, c in ipairs(list) do
+		local w = base * (floorOnly and 0.5 or (c.part.CanCollide and 1 or 1.5))
+		blame(c.part, w)
+	end
+end
+
 local function setupLearning(char)
 	for _, c in ipairs(charConns) do pcall(function() c:Disconnect() end) end
 	table.clear(charConns)
 	table.clear(touchCount)
 	table.clear(touchStart)
+	table.clear(supportHist)
+	table.clear(posHist)
 	if not CONFIG.LearnHazards or not char then return end
 	local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
 	if not hum then return end
@@ -2178,16 +2410,12 @@ local function setupLearning(char)
 			end)
 		end
 	end
-	-- damage / death: blame what we JUST started touching (death counts double, damage needs 2 hits)
 	charConns[#charConns + 1] = hum.HealthChanged:Connect(function(h)
 		local dropped = lastHealth - h
 		lastHealth = h
 		if dropped < 0.5 then return end
-		local now = os.clock()
-		lastDamageAt = now
-		for part, ts in pairs(touchStart) do
-			if now - ts <= 0.6 then blame(part, h <= 0 and 2 or 1) end
-		end
+		lastDamageAt = os.clock()
+		onOwnDamage(h)
 	end)
 end
 
@@ -2222,25 +2450,32 @@ task.spawn(function()
 	end
 end)
 
+-- 10 Hz history of what held us up and where we were (used to attribute damage correctly)
+task.spawn(function()
+	while alive do
+		task.wait(0.1)
+		local _, _, root = getChar()
+		if root then
+			local now = os.clock()
+			local g = Workspace:Raycast(root.Position, V3(0, -8, 0), worldParams)
+			supportHist[#supportHist + 1] = { t = now, inst = g and g.Instance }
+			posHist[#posHist + 1] = { t = now, pos = root.Position }
+			if #supportHist > 20 then table.remove(supportHist, 1) end
+			if #posHist > 20 then table.remove(posHist, 1) end
+		end
+	end
+end)
+
 local othersHist = setmetatable({}, { __mode = "k" })
 local otherConns = {}
-
-local function isCharPart(p)
-	local m = p.Parent
-	for _ = 1, 3 do
-		if not m then return false end
-		if m:FindFirstChildOfClass("Humanoid") then return true end
-		m = m.Parent
-	end
-	return false
-end
 
 local function bodySet(root)
 	local set = {}
 	for _, p in ipairs(Workspace:GetPartBoundsInBox(CFrame.new(root.Position), V3(2.6, 5.2, 2.6), hazardOverlap)) do
 		if p.ClassName ~= "Terrain" and not isCharPart(p) then set[p] = true end
 	end
-	return set
+	local g = Workspace:Raycast(root.Position, V3(0, -8, 0), worldParams) -- what holds them up
+	return set, g and g.Instance
 end
 
 local function trackOthers()
@@ -2278,13 +2513,23 @@ local function trackOthers()
 									break
 								end
 							end
+							local cands = {}
 							for part in pairs(newest) do
-								if not (old and old[part]) then blame(part, hp <= 0 and 1 or 0.5) end
+								if not (old and old[part]) then cands[#cands + 1] = { part = part } end
+							end
+							local support = {}
+							for _, e in ipairs(rec.ring) do
+								if e.support and now - e.t <= 1.5 then support[e.support] = true end
+							end
+							local list, floorOnly = pickCulprits(cands, support)
+							for _, c in ipairs(list) do
+								blame(c.part, (hp <= 0 and 1 or 0.5) * (floorOnly and 0.5 or (c.part.CanCollide and 1 or 1.5)))
 							end
 						end)
 					end
 					local ring = rec.ring
-					ring[#ring + 1] = { t = os.clock(), set = bodySet(r) }
+					local set, sup = bodySet(r)
+					ring[#ring + 1] = { t = os.clock(), set = set, support = sup }
 					if #ring > 6 then table.remove(ring, 1) end
 				end
 			end
@@ -2297,6 +2542,7 @@ task.spawn(trackOthers)
 connect(player.CharacterAdded, function(char)
 	rootHCache = nil
 	stop()
+	refreshFilter()
 	task.spawn(setupLearning, char)
 end)
 
