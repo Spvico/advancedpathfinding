@@ -87,6 +87,12 @@ local CONFIG = {
 	VaultEnabled      = true,  -- jump over walls to the ground on the far side
 	MaxVaultExpansions = 600,
 
+	MaxLateJump       = 0.25,  -- seconds AFTER leaving a ledge we may still jump (extends reach ~1.5-2 studs)
+	FakeShiftlock     = true,  -- our own smooth facing control (camera is never touched)
+	TurnRate          = 14,    -- fastest turn of the fake shiftlock (rad/s)
+	TurnStiffness     = 90,    -- spring stiffness, critically damped = smooth, no overshoot
+	NarrowSqueeze     = true,  -- slip through gaps narrower than the body's width by turning sideways
+
 	ShowHazards       = true,  -- outline in red what it believes is deadly
 	LearnFromOthers   = true,  -- learn kill bricks from other players dying / getting hurt
 	PersistHazards    = true,  -- remember learned + marked hazards per game (needs an executor with writefile)
@@ -147,7 +153,7 @@ local brakeUntil = 0
 local vaultExpansions = 0
 local hazRejects = 0
 local lastHazardPart = nil
-local S = { g = 196.2, vy = 50, vyReal = 50, speed = 16, rootH = 3, maxH = 6.4, iceAccel = 10 }
+local S = { g = 196.2, vy = 50, vyReal = 50, speed = 16, rootH = 3, maxH = 6.4, iceAccel = 10, bodyL = 1.9, bodyF = 0.7 }
 local CANCEL = {}
 
 ---------------------------------------------------------------- GUI
@@ -292,6 +298,12 @@ local function readStats(hum, root)
 	S.speed = hum.WalkSpeed
 	S.rootH = measureRootH(hum, root)
 	S.maxH = S.vy * S.vy / (2 * g)
+	-- measured hitbox (lateral / front-back half sizes incl. arms + accessories)
+	local okb, ext = pcall(function() return hum.Parent:GetExtentsSize() end)
+	if okb and ext then
+		S.bodyL = math.clamp(ext.X / 2 + 0.1, 0.9, 2.4)
+		S.bodyF = math.clamp(ext.Z / 2 + 0.1, 0.5, 1.3)
+	end
 end
 
 -- time to come back down to (takeoff height + dh)
@@ -299,6 +311,26 @@ local function flightTime(dh)
 	local disc = S.vy * S.vy - 2 * S.g * dh
 	if disc < 0 then return nil end
 	return (S.vy + math.sqrt(disc)) / S.g
+end
+
+-- total air time when we leave the ledge and jump `tau` seconds LATE: we fall for tau first (keeping our
+-- horizontal speed), then jump from the lower height. A short delay buys extra horizontal distance.
+local function lateTime(dh, tau)
+	local disc = S.vy * S.vy - 2 * S.g * (dh + 0.5 * S.g * tau * tau)
+	if disc < 0 then return nil end
+	return tau + (S.vy + math.sqrt(disc)) / S.g
+end
+
+-- smallest delay tau (0 = ordinary jump) for which WalkSpeed * airtime covers `need` studs. nil = can't.
+local function fitReach(dh, need, allowLate)
+	local tau = 0
+	local maxTau = allowLate and CONFIG.MaxLateJump or 0
+	while tau <= maxTau + 1e-6 do
+		local tt = lateTime(dh, tau)
+		if tt and need <= S.speed * tt * CONFIG.ReachSafety - 0.2 then return tt, tau end
+		tau += 0.03
+	end
+	return nil
 end
 
 local function checkYield()
@@ -558,6 +590,13 @@ local function hazardAtBody(pos)
 	return c
 end
 
+-- same question, but with the REAL hitbox turned to face `d` (we face where we go): wide across, thin along
+local function hazardOriented(pos, d)
+	if not CONFIG.AvoidHazards then return false end
+	local c = V3(pos.X, pos.Y + 2.65, pos.Z)
+	return hazardBox(CFrame.lookAt(c, c + d), V3((S.bodyL or 1.9) * 2, 5.9, (S.bodyF or 0.7) * 2))
+end
+
 ---------------------------------------------------------------- slippery surfaces
 -- friction = the part's CustomPhysicalProperties, else the material default (Ice 0.02, Glacier 0.05, ...)
 local matCache = {}
@@ -626,7 +665,9 @@ local function findTakeoff(P, dir, maxLen)
 				T = T - dir * 0.5
 				tries += 1
 			end
-			return T
+			local edge = lastP
+			if r and isHazardHit(r) then edge = nil end -- not a drop-off, just a hazard in front: no late jump from here
+			return T, edge
 		end
 		k += 1
 	end
@@ -635,22 +676,36 @@ local function findTakeoff(P, dir, maxLen)
 end
 
 -- body-sized sweeps along the predicted arc
-local function arcClear(T, L, t, legs, steps, via)
+local function arcClear(T, L, t, legs, steps, via, tau, rad)
 	local N = steps or 5
-	local len1, total = 0, 0
-	if via then
-		len1 = flatDist(via, T)
-		total = len1 + flatDist(L, via)
-	end
+	tau = tau or 0
+	rad = rad or RADIUS
+	local legR = (rad < RADIUS) and math.max(rad - 0.05, 0.3) or 0.8
+	local len1 = via and flatDist(via, T) or 0
+	local total = via and (len1 + flatDist(L, via)) or flatDist(L, T)
 	local lip = (L.Y - T.Y > CONFIG.StepUp) and L.Y or nil
+	local aim = via or L
+	local hv = V3(aim.X - T.X, 0, aim.Z - T.Z)
+	local hdir = (hv.Magnitude > 1e-3) and hv.Unit or V3(0, 0, 1)
+	local y0 = -0.5 * S.g * tau * tau
 	local prev
 	for i = 0, N do
 		local s = i / N
-		local tt = t * s
+		local time = t * s
+		-- distance along the horizontal path. Late jump: full speed while we fall for tau, then uniform.
+		local dist
+		if tau > 0 then
+			local early = S.speed * tau
+			if time <= tau then
+				dist = math.min(S.speed * time, total)
+			else
+				dist = math.min(total, early + (total - early) * (time - tau) / math.max(t - tau, 1e-3))
+			end
+		else
+			dist = total * s
+		end
 		local px, pz
 		if via and total > 1e-4 then
-			-- horizontal path T -> via -> L at uniform speed (time fraction = path fraction)
-			local dist = s * total
 			if dist <= len1 then
 				local f = (len1 > 1e-4) and dist / len1 or 0
 				px, pz = T.X + (via.X - T.X) * f, T.Z + (via.Z - T.Z) * f
@@ -660,14 +715,24 @@ local function arcClear(T, L, t, legs, steps, via)
 				px, pz = via.X + (L.X - via.X) * f, via.Z + (L.Z - via.Z) * f
 			end
 		else
-			px, pz = T.X + (L.X - T.X) * s, T.Z + (L.Z - T.Z) * s
+			local f = (total > 1e-4) and dist / total or 0
+			px, pz = T.X + (L.X - T.X) * f, T.Z + (L.Z - T.Z) * f
 		end
-		local p = V3(px, T.Y + S.rootH + S.vy * tt - 0.5 * S.g * tt * tt, pz)
-		if i >= 1 and i < N and hazardBox(CFrame.new(p), V3(2.2, 4.8, 2.2)) then return false end
+		local air = time - tau
+		local y
+		if tau > 0 and time < tau then
+			y = -0.5 * S.g * time * time
+		else
+			y = y0 + S.vy * air - 0.5 * S.g * air * air
+		end
+		local p = V3(px, T.Y + S.rootH + y, pz)
+		if i >= 1 and i < N and hazardBox(CFrame.lookAt(p, p + hdir), V3((S.bodyL or 1.9) * 2, 4.8, (S.bodyF or 0.7) * 2)) then
+			return false
+		end
 		if prev and (not lip or (prev.Y - S.rootH) >= lip - 0.5) then
 			local d = p - prev
-			if sweep(prev, d, RADIUS) or raycast(prev + V3(0, 2, 0), d)
-				or (legs and sweep(prev + V3(0, -1.8, 0), d, 0.8)) then return false end
+			if sweep(prev, d, rad) or raycast(prev + V3(0, 2, 0), d)
+				or (legs and sweep(prev + V3(0, -1.8, 0), d, legR)) then return false end
 		end
 		prev = p
 	end
@@ -680,8 +745,8 @@ local climbChecks = 0
 local climbSeen = {}
 local badLadders = setmetatable({}, { __mode = "k" })
 
--- Top walkable face of a part. Works for blocks in ANY orientation, and for cylinders
--- (a Roblox cylinder's round face is on its local X axis, so a flat disk is "rotated").
+-- Top walkable face of a part. Works for blocks in ANY orientation (up to 60 degrees of tilt, the biggest of the
+-- up-ish faces wins so tilted ramps pick their real top) and for cylinders (their round face is on local X).
 local function topFace(part)
 	local cached = faceCache[part]
 	if cached ~= nil then return cached or nil end
@@ -716,7 +781,7 @@ local function topFace(part)
 	return face or nil
 end
 
--- closest point on the face to P, pulled LandMargin inside the edge (circle-aware)
+-- closest point on the face to P, pulled `margin` inside the edge (circle-aware)
 local function nearestOnFace(face, P, margin)
 	margin = margin or CONFIG.LandMargin
 	local d = P - face.center
@@ -749,17 +814,24 @@ local function arcRel(tt) return S.vy * tt - 0.5 * S.g * tt * tt end -- height a
 local FAN = { 0, 0.4, -0.4, 0.8, -0.8 } -- takeoff search directions around the straight line to the landing (rad)
 local CURVE_OFFS = { 2.2, 3.6, 5.4, 7.5 }   -- how far the arch swings out sideways (studs)
 local CURVE_FRACS = { 0.5, 0.3, 0.7 }       -- where along the straight line the swing is widest
+local buildHop                              -- defined with the hazard code below
+
+local function narrowR() return math.max(S.bodyF or 0.7, 0.6) end -- body radius when turned sideways
 
 local function buildJump(node, face, pt, m, allowCurve)
 	local P = node.pos
 	local r = snapLanding(face, pt)
 	if not r then return nil end
 	local L = r.Position
-	if hazardAtBody(L) then return nil end
 	local fv = V3(L.X - P.X, 0, L.Z - P.Z)
 	local fd = fv.Magnitude
 	if fd < 0.2 then return nil end
 	local dir = fv / fd
+	if hazardOriented(L, dir) then
+		-- the landing sits next to a hazard: hop it instead (land PAST it, using the hazard's real shape)
+		if allowCurve and buildHop then return buildHop(node, dir) end
+		return nil
+	end
 	local mEff = math.min(m or CONFIG.LandMargin, face.circle and face.r or math.min(face.hu, face.hv))
 	local slipPen = isSlipperyHit(r) and CONFIG.SlipPenalty or 0
 	local Ts = {}
@@ -768,7 +840,7 @@ local function buildJump(node, face, pt, m, allowCurve)
 	for _, ang in ipairs(FAN) do
 		local c, sn = math.cos(ang), math.sin(ang)
 		local dd = V3(dir.X * c - dir.Z * sn, 0, dir.X * sn + dir.Z * c)
-		local T = findTakeoff(P, dd, math.min(fd + 2, CONFIG.EdgeScan))
+		local T, edge = findTakeoff(P, dd, math.min(fd + 2, CONFIG.EdgeScan))
 		if T then
 			Ts[#Ts + 1] = T
 			local dh = L.Y - T.Y
@@ -781,12 +853,33 @@ local function buildJump(node, face, pt, m, allowCurve)
 						-- going UP: our feet must be above the landing's lip when the body reaches its edge
 						ok = arcRel(math.max(0, hd - mEff - 0.5) / (hd / t)) >= dh + 0.1
 					end
-					if ok and arcClear(T, L, t) then
-						return {
-							kind = "jump", pos = L, inst = r.Instance, takeoff = T,
-							cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + slipPen,
-						}
+					if ok then
+						if arcClear(T, L, t) then
+							return {
+								kind = "jump", pos = L, inst = r.Instance, takeoff = T,
+								cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + slipPen,
+							}
+						elseif CONFIG.NarrowSqueeze and CONFIG.FakeShiftlock
+							and arcClear(T, L, t, false, 6, nil, nil, narrowR()) then
+							-- the gap between walls is too tight for the body face-on: go through sideways
+							return {
+								kind = "jump", pos = L, inst = r.Instance, takeoff = T, narrow = true,
+								cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + slipPen + 1.5,
+							}
+						end
 					end
+				end
+			end
+			-- LATE JUMP: too far for an ordinary jump? run off the ledge and jump a moment later in mid-air.
+			-- The extra fall time carries us further forward (the jump start is "extended").
+			if edge and CONFIG.MaxLateJump > 0 and L.Y - edge.Y <= CONFIG.StepUp then
+				local need = flatDist(L, edge)
+				local tt, tau = fitReach(L.Y - edge.Y, need, true)
+				if tt and tau > 0 and need >= S.speed * tau + 0.5 and arcClear(edge, L, tt, false, 8, nil, tau) then
+					return {
+						kind = "jump", pos = L, inst = r.Instance, takeoff = edge, late = tau,
+						cost = flatDist(P, edge) + need + CONFIG.JumpPenalty + 1 + slipPen,
+					}
 				end
 			end
 		end
@@ -1168,15 +1261,15 @@ local function expandVaults(node, out, dirs)
 end
 
 -- Hop: a hazard (lava stripe, kill bar) lies across the way. We use the hazard's ACTUAL SHAPE:
---   1. for the direction we want to go, intersect that line with the hazard's box grown by our body size
---      -> the exact stretch [S0, S1] of the line where our body would touch it (any angle, any length)
---   2. take off just before S0, land just after S1
---   3. ask the jump physics (air time from JumpPower|JumpHeight + gravity, reach from WalkSpeed) whether
---      that fits, and sweep the arc (body + legs). If yes -> jump, if not -> not possible.
-local BODY_HALF = V3(1.15, 2.95, 1.15) -- body box half-extents (same box hazardAtBody uses)
-local BODY_OFF = 2.65                  -- body box centre above the feet
+--   1. for the direction we want to go, intersect that line with the hazard's box grown by our HITBOX
+--      (turned to face that way: thin along the line, wide across) -> the exact stretch [S0, S1] of the
+--      line where our body would touch it (any angle, any length)
+--   2. take off just before S0 (or from the ledge before a gap that comes first), land just after S1
+--   3. ask the jump physics whether that fits: normal jump, or a LATE jump (run off the ledge, jump a moment
+--      later = longer reach). Sweep the arc (body + legs). If it fits -> jump, if not -> not possible.
+local BODY_OFF = 2.65 -- body box centre above the feet
 
--- where along the ray (origin o, unit direction d) is the body CENTRE inside this part's box grown by the body?
+-- where along the ray (origin o, unit direction d) is the body CENTRE inside this part's box grown by the hitbox?
 local function zoneAlong(part, o, d)
 	local cf, half = part.CFrame, part.Size * 0.5
 	local lo, ld = cf:PointToObjectSpace(o), cf:VectorToObjectSpace(d)
@@ -1184,10 +1277,12 @@ local function zoneAlong(part, o, d)
 	local ext = { half.X, half.Y, half.Z }
 	local los = { lo.X, lo.Y, lo.Z }
 	local lds = { ld.X, ld.Y, ld.Z }
+	local hl, hf = S.bodyL or 1.9, S.bodyF or 0.7
+	local lat = V3(-d.Z, 0, d.X)
 	local tmin, tmax = -math.huge, math.huge
 	for i = 1, 3 do
 		local a = axes[i]
-		local e = ext[i] + BODY_HALF.X * math.abs(a.X) + BODY_HALF.Y * math.abs(a.Y) + BODY_HALF.Z * math.abs(a.Z)
+		local e = ext[i] + hl * math.abs(a:Dot(lat)) + 2.95 * math.abs(a.Y) + hf * math.abs(a:Dot(d))
 		if math.abs(lds[i]) < 1e-6 then
 			if math.abs(los[i]) > e then return nil end
 		else
@@ -1200,7 +1295,7 @@ local function zoneAlong(part, o, d)
 	return tmin, tmax
 end
 
-local function buildHop(node, d)
+buildHop = function(node, d)
 	local P = node.pos
 	local len = math.min(reachLimit(P) + 2, 30)
 	if len < 3 then return nil end
@@ -1209,7 +1304,7 @@ local function buildHop(node, d)
 	local boxCf = CFrame.lookAt(center, center + d)
 
 	local zones = {}
-	for _, part in ipairs(Workspace:GetPartBoundsInBox(boxCf, V3(5, 7, len), hazardOverlap)) do
+	for _, part in ipairs(Workspace:GetPartBoundsInBox(boxCf, V3(6, 7, len), hazardOverlap)) do
 		if part.ClassName ~= "Terrain" and hazardPart(part) then
 			local tin, tout = zoneAlong(part, o, d)
 			if tin and tout > 0 then zones[#zones + 1] = { tin, tout } end
@@ -1218,7 +1313,7 @@ local function buildHop(node, d)
 	if #zones == 0 then return nil end
 	table.sort(zones, function(a, b) return a[1] < b[1] end)
 	local S0, S1 = zones[1][1], zones[1][2]
-	for i = 2, #zones do -- hazards closer together than a body width can't be landed between: one big zone
+	for i = 2, #zones do -- hazards closer together than a body can't be landed between: one big zone
 		if zones[i][1] <= S1 + 1.2 then S1 = math.max(S1, zones[i][2]) else break end
 	end
 
@@ -1229,23 +1324,38 @@ local function buildHop(node, d)
 		end
 	end
 
-	-- takeoff just before the zone (behind us if we already stand inside it: the step backs off first)
-	local T = P
+	-- takeoff: floor right before the zone, or (a gap comes first) the ledge before that gap.
+	-- If we already stand inside the zone the step backs off first (retreat logic).
+	local T, edge = P, nil
 	local Th = groundAt(P + d * (S0 - 0.25))
-	if Th and not hazardAtBody(Th.Position) then T = Th.Position end
-	if T ~= P and not pathClear(P, T, RADIUS) then return nil end
+	if Th and not hazardOriented(Th.Position, d) then
+		T = Th.Position
+		if T ~= P and not pathClear(P, T, RADIUS) then return nil end
+	else
+		local Te, ed = findTakeoff(P, d, math.min(math.max(S0, 1.5), CONFIG.EdgeScan + 3))
+		if Te then T, edge = Te, ed end
+	end
 
 	for _, extra in ipairs({ 0.3, 0.7, 1.2, 1.8 }) do
 		local hit = groundAt(P + d * (S1 + extra))
-		if hit and hit.Normal.Y >= COS_LAND and not hazardAtBody(hit.Position) then
+		if hit and hit.Normal.Y >= COS_LAND and not hazardOriented(hit.Position, d) then
 			local L = hit.Position
+			local need = flatDist(L, T)
 			local t = flightTime(L.Y - T.Y)
-			if t then
-				local D = flatDist(L, T)
-				if D <= S.speed * t * CONFIG.ReachSafety - 0.2 and arcClear(T, L, t, true, 8) then
+			if t and need <= S.speed * t * CONFIG.ReachSafety - 0.2 and arcClear(T, L, t, true, 8) then
+				return {
+					kind = "jump", vault = true, pos = L, inst = hit.Instance, takeoff = T,
+					cost = flatDist(P, T) + need + CONFIG.JumpPenalty + 1, runup = pickRunup(node, T, d),
+				}
+			end
+			-- too far for an ordinary jump: late jump from the ledge (longer reach)
+			if edge and CONFIG.MaxLateJump > 0 and L.Y - edge.Y <= CONFIG.StepUp then
+				local need2 = flatDist(L, edge)
+				local tt, tau = fitReach(L.Y - edge.Y, need2, true)
+				if tt and tau > 0 and arcClear(edge, L, tt, true, 8, nil, tau) then
 					return {
-						kind = "jump", vault = true, pos = L, inst = hit.Instance, takeoff = T,
-						cost = flatDist(P, T) + D + CONFIG.JumpPenalty + 1, runup = pickRunup(node, T, d),
+						kind = "jump", vault = true, pos = L, inst = hit.Instance, takeoff = edge, late = tau,
+						cost = flatDist(P, edge) + need2 + CONFIG.JumpPenalty + 1, runup = pickRunup(node, edge, d),
 					}
 				end
 			end
@@ -1293,7 +1403,13 @@ local function tryWalk(a, tx, tz)
 			q = V3(b.X, ay, b.Z) -- walk off the ledge, then fall
 			drop = true
 		end
-		if ok and pathClear(a, q, RADIUS) then
+		local clearN = ok and pathClear(a, q, RADIUS)
+		local narrow = false
+		if ok and not clearN and CONFIG.NarrowSqueeze and CONFIG.FakeShiftlock then
+			clearN = pathClear(a, q, narrowR()) -- too tight face-on: can we pass sideways?
+			narrow = clearN
+		end
+		if ok and clearN then
 			if hazardAtBody(b) or hazardAtBody((a + b) / 2) then
 				hazRejects += 1
 				return nil, "hazard" -- the step is fine except a hazard sits in it: let the hop logic try to clear it
@@ -1303,7 +1419,7 @@ local function tryWalk(a, tx, tz)
 				cost += CONFIG.SlipPenalty
 				if CONFIG.SlipEdgePenalty > 0 then cost += slipEdgePenalty(b) end
 			end
-			return b, r.Instance, cost, drop
+			return b, r.Instance, cost + (narrow and 1.5 or 0), drop, narrow
 		end
 	end
 	-- steep ramp probe (rise bigger than a step)
@@ -1324,9 +1440,9 @@ local function expandWalk(node, out)
 	local bdirs, hdirs = {}, {}
 	for i = 1, 8 do
 		local o = OFFSETS[i]
-		local b, inst, cost, drop = tryWalk(p, p.X + o[1] * CELL, p.Z + o[2] * CELL)
+		local b, inst, cost, drop, narrow = tryWalk(p, p.X + o[1] * CELL, p.Z + o[2] * CELL)
 		if b then
-			out[#out + 1] = { kind = "walk", pos = b, inst = inst, cost = cost, drop = drop, from = p }
+			out[#out + 1] = { kind = "walk", pos = b, inst = inst, cost = cost, drop = drop, from = p, narrow = narrow }
 			if drop then gaps += 1 end
 		elseif inst == "gap" then
 			gaps += 1
@@ -1480,7 +1596,7 @@ local function simplify(steps, startPos)
 	for i, st in ipairs(steps) do
 		local nxt = steps[i + 1]
 		local drop = false
-		if st.kind == "walk" and nxt and nxt.kind == "walk" then
+		if st.kind == "walk" and nxt and nxt.kind == "walk" and st.narrow == nxt.narrow then
 			local d1, d2 = flat(st.pos - prev), flat(nxt.pos - st.pos)
 			if d1.Magnitude > 0.01 and d2.Magnitude > 0.01
 				and d1.Unit:Dot(d2.Unit) > 0.995
@@ -1515,7 +1631,7 @@ local function buildSteps(endNode, goal, complete, startPos)
 			steps[#steps + 1] = {
 				kind = "jump", takeoff = e.takeoff, land = e.pos,
 				dir = d.Magnitude > 0.01 and d.Unit or V3(0, 0, 1),
-				lip = (e.pos.Y - e.takeoff.Y) > CONFIG.StepUp, vault = e.vault, runup = e.runup, via = e.via,
+				lip = (e.pos.Y - e.takeoff.Y) > CONFIG.StepUp, vault = e.vault, runup = e.runup, via = e.via, late = e.late, narrow = e.narrow,
 			}
 		elseif e.drop then
 			-- walk off a ledge and fall (any depth): handled like a jump with no jump, steered to the landing
@@ -1525,7 +1641,7 @@ local function buildSteps(endNode, goal, complete, startPos)
 				dir = fd.Magnitude > 0.01 and fd.Unit or V3(0, 0, 1), lip = false,
 			}
 		else
-			steps[#steps + 1] = { kind = "walk", pos = e.pos }
+			steps[#steps + 1] = { kind = "walk", pos = e.pos, narrow = e.narrow }
 		end
 	end
 	if complete then steps[#steps + 1] = { kind = "walk", pos = goal } end
@@ -1578,6 +1694,47 @@ local function userSteering()
 	return false
 end
 
+---------------------------------------------------------------- fake shiftlock
+-- Real shift lock turns the CAMERA with the character. This doesn't touch the camera at all: AutoRotate is
+-- switched off while we need a specific facing, and we turn the character ourselves with a critically damped
+-- spring (smooth start, smooth stop, speed-limited, no overshoot). Movement direction is independent of
+-- facing, so we can strafe / back off while facing where we are going:
+--   * jumps face the jump direction the whole time (hitbox thin side leads, no turning around while backing off)
+--   * narrow gaps: face ACROSS the gap and slide through sideways (the body is only ~1 stud thin that way)
+local Face = { target = nil, w = 0, prevAuto = nil }
+
+local function faceRelease(hum)
+	if Face.prevAuto ~= nil and hum then
+		local prev = Face.prevAuto
+		pcall(function() hum.AutoRotate = prev end)
+	end
+	Face.target, Face.w, Face.prevAuto = nil, 0, nil
+end
+
+local function faceUpdate(hum, root, dt)
+	if not CONFIG.FakeShiftlock then return end
+	local tgt = Face.target
+	if not tgt or tgt.Magnitude < 0.05 then
+		if Face.prevAuto ~= nil then faceRelease(hum) end
+		return
+	end
+	if Face.prevAuto == nil then Face.prevAuto = hum.AutoRotate end
+	hum.AutoRotate = false
+	local look = root.CFrame.LookVector
+	local cur = math.atan2(-look.X, -look.Z)
+	local want = math.atan2(-tgt.X, -tgt.Z)
+	local err = (want - cur + math.pi) % (2 * math.pi) - math.pi
+	local K = CONFIG.TurnStiffness
+	Face.w = Face.w + (K * err - 2 * math.sqrt(K) * Face.w) * dt
+	Face.w = math.clamp(Face.w, -CONFIG.TurnRate, CONFIG.TurnRate)
+	local dy = Face.w * dt
+	if math.abs(dy) >= math.abs(err) and dy * err >= 0 then
+		dy = err
+		Face.w = 0
+	end
+	root.CFrame = root.CFrame * CFrame.Angles(0, dy, 0)
+end
+
 local function doJump(hum)
 	hum.Jump = true
 	pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
@@ -1591,6 +1748,7 @@ local function stop(msg, color)
 	visuals:ClearAllChildren()
 	local _, hum = getChar()
 	if hum then hum:Move(Vector3.zero, false) end
+	faceRelease(hum)
 	if msg then notify(msg, color) end
 end
 
@@ -1600,6 +1758,7 @@ local function finish(f)
 	follow = nil
 	local _, hum, root = getChar()
 	if hum then hum:Move(Vector3.zero, false) end
+	faceRelease(hum)
 	if hum and root and CONFIG.IceSupport then
 		local r = raycast(root.Position, V3(0, -(S.rootH + 3), 0))
 		if r and isSlipperyHit(r) then brakeUntil = os.clock() + 1.5 end -- ice: counter-steer to stop
@@ -1818,6 +1977,10 @@ end
 
 local function onStep(dt)
 	local f = follow
+	if not f and Face.prevAuto ~= nil then
+		local _, h0 = getChar()
+		faceRelease(h0)
+	end
 	if not f and active and brakeUntil > os.clock() then
 		-- arrived on ice: push against our own velocity so we don't slide off the platform
 		local _, hum, root = getChar()
@@ -1845,6 +2008,8 @@ local function onStep(dt)
 	local rootH = S.rootH
 	local feet = pos - V3(0, rootH, 0)
 	local grounded = hum.FloorMaterial ~= Enum.Material.Air
+	faceUpdate(hum, root, dt) -- turn toward what we asked for LAST frame...
+	Face.target = nil          -- ...and ask again this frame
 	local step = f.steps[f.i]
 
 	-- pushed ahead (conveyor etc.): if we're already at a later waypoint, skip to it
@@ -1878,6 +2043,10 @@ local function onStep(dt)
 			if seg.Magnitude > 0.1 and fl:Dot(seg.Unit) < 0 then done = true end
 		end
 		if not done then
+			if step.narrow and dist > 0.05 then
+				local pd = fl / dist
+				Face.target = V3(-pd.Z, 0, pd.X) -- face ACROSS the gap, slide through sideways
+			end
 			if dist <= 0.05 then
 				hum:Move(Vector3.zero, false)
 			elseif slip then
@@ -2011,6 +2180,7 @@ local function onStep(dt)
 			end
 		elseif step.phase == "run" then
 			-- keep running at full speed, fire the jump WHILE moving
+			if CONFIG.FakeShiftlock then Face.target = step.narrow and V3(-step.dir.Z, 0, step.dir.X) or step.dir end
 			local toT = V3(T.X - feet.X, 0, T.Z - feet.Z)
 			local d = toT.Magnitude
 			local along = toT:Dot(step.dir)
@@ -2022,14 +2192,34 @@ local function onStep(dt)
 				local ru = step.runup or 1.4
 				local R = V3(T.X - step.dir.X * ru - feet.X, 0, T.Z - step.dir.Z * ru - feet.Z)
 				hum:Move((R.Magnitude > 0.05) and R.Unit or Vector3.zero, false)
-			elseif slip then
+			elseif slip and not step.passed then
 				iceRunSteer(hum, root, toT, d, step.dir, speed)
 			else
-				hum:Move((d > 0.6) and (toT / d) or step.dir, false)
+				-- once we have passed the takeoff point (late jump) keep running FORWARD, never back toward it
+				hum:Move((d > 0.6 and not step.passed) and (toT / d) or step.dir, false)
 			end
 			local rv = root.AssemblyLinearVelocity
 			local hs = slip and math.sqrt(rv.X * rv.X + rv.Z * rv.Z) or speed
-			if not retreat and grounded and along <= math.max(0.2, hs * dt * 1.25) then
+			if step.late and not retreat then
+				-- LATE JUMP: run OFF the ledge at full speed, then jump a moment later in mid-air (extends the jump start)
+				if not grounded then
+					step.passed = true
+					step.leftAt = step.leftAt or os.clock()
+					if os.clock() - step.leftAt >= step.late then
+						doJump(hum)
+						step.phase, step.t0, step.left, step.tries = "air", os.clock(), true, 1
+					end
+				elseif along <= math.max(0.2, hs * dt * 1.25) then
+					step.passed = true
+					if along < -2.2 then -- still on the floor well past the "edge": the ledge isn't there, jump now
+						doJump(hum)
+						step.phase, step.t0, step.left, step.tries = "air", os.clock(), false, 1
+					end
+				end
+				if step.phase == "run" and os.clock() - step.t0 > 8 then
+					replan(f, "run-up timeout") return
+				end
+			elseif not retreat and grounded and along <= math.max(0.2, hs * dt * 1.25) then
 				-- re-check with the REAL position: if we got shoved off the takeoff line, don't jump short
 				local tNow = flightTime(L.Y - feet.Y)
 				local plen = step.via and (flatDist(feet, step.via) + flatDist(step.via, L)) or flatDist(feet, L)
@@ -2044,7 +2234,7 @@ local function onStep(dt)
 		else
 			local vy = root.AssemblyLinearVelocity.Y
 			if not step.left and (not grounded or vy > 8) then step.left = true end
-			if step.left and not step.fall and not step.calDone then
+			if step.left and not step.fall and not step.late and not step.calDone then
 				-- calibrate: peak upward speed right after takeoff = this player's real jump velocity
 				step.maxVy = math.max(step.maxVy or 0, vy)
 				if os.clock() - step.t0 > 0.12 then
@@ -2099,6 +2289,7 @@ local function onStep(dt)
 				if step.lip and feet.Y < L.Y - 0.3 then throttle = math.max(throttle, 0.6) end
 				local mv = (rdDir > 0.05) and (rem / rdDir) or step.dir
 				hum:Move(mv * throttle, false)
+				if CONFIG.FakeShiftlock then Face.target = step.narrow and V3(-mv.Z, 0, mv.X) or mv end
 				if CONFIG.VelocityAssist then
 					local v = mv * throttle * speed
 					root.AssemblyLinearVelocity = V3(v.X, vy, v.Z)
@@ -2548,6 +2739,7 @@ end)
 
 local function destroy()
 	alive = false
+	do local _, h1 = getChar(); faceRelease(h1) end
 	for _, c in ipairs(otherConns) do pcall(function() c:Disconnect() end) end
 	active = false
 	searchId += 1
