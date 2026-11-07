@@ -1,5 +1,5 @@
 --[[
-	ADVANCED PATHFINDER v1.1
+	ADVANCED PATHFINDER v1.2
 	Created by Spvico
 
 	Custom A* pathfinder (NO PathfindingService) with physics-aware obby jumping.
@@ -16,6 +16,16 @@
 	  - run-up never stops: Move() stays active, jump is fired while still running
 	  - in the air, throttle is recomputed EVERY FRAME from (distance left / time left)
 	    so you touch down exactly on the landing point without braking before the jump
+
+	v1.2 FIXES (roofs / overhangs)
+	  - HEADROOM: jump arcs are now swept with a HEAD sphere too, and ledge climbs no longer skip the first part of
+	    the rise. A takeoff spot under an overhang (head would bump the roof) is rejected.
+	  - SIDE-STEP TAKEOFFS: if the straight takeoff is under a roof, it looks for a spot beside / in front of the wall
+	    with open air above (slides along the wall, backs away from it) and jumps from there.
+	  - FAKE SHIFTLOCK IN LEDGE JUMPS: the body keeps FACING THE LEDGE for the whole jump while the movement direction
+	    is free (strafe / walk backward) - thin side leads, no turning around.
+	  - Failed jumps remember their takeoff spot (45 s) so the re-plan picks another way instead of repeating it.
+	  - Runtime roof check right before a ledge jump.
 
 	v1.1 FIXES
 	  - LEDGE CLIMB MODEL (the big one): Roblox limbs have CanCollide = false. Only the root part, torso and head
@@ -177,7 +187,7 @@ local hazRejects = 0
 local lastHazardPart = nil
 local S = {
 	g = 196.2, vy = 50, vyReal = 50, speed = 16, rootH = 3, maxH = 6.4, iceAccel = 10, bodyL = 1.9, bodyF = 0.7,
-	rootHalf = 1, liftBase = 1.6, lift = 1.6, liftPenalty = 0,
+	rootHalf = 1, liftBase = 1.6, lift = 1.6, liftPenalty = 0, headUp = 2.4, bad = {}, slideN = 0,
 }
 local CANCEL = {}
 
@@ -333,6 +343,7 @@ local function readStats(hum, root)
 	if okb and ext then
 		S.bodyL = math.clamp(ext.X / 2 + 0.1, 0.9, 2.4)
 		S.bodyF = math.clamp(ext.Z / 2 + 0.1, 0.5, 1.3)
+		S.headUp = math.clamp(ext.Y - S.rootH, 1.8, 3.4) -- root centre -> top of head / hair
 	end
 end
 
@@ -714,28 +725,73 @@ local function findTakeoff(P, dir, maxLen)
 	return nil                    -- floor continues, no ledge here
 end
 
--- body-sized sweeps along the predicted arc
-local function arcClear(T, L, t, legs, steps, via, tau, rad)
+-- horizontal distance we can travel from T along the route before a wall stops the body (sphere sweeps at body height)
+local function pathStop(T, L, via)
+	local function leg(a, b)
+		local v = V3(b.X - a.X, 0, b.Z - a.Z)
+		local l = v.Magnitude
+		if l < 1e-3 then return nil, 0 end
+		local r = sweep(a + V3(0, MID_H, 0), v, RADIUS)
+		return r and r.Distance or nil, l
+	end
+	if via then
+		local d1, l1 = leg(T, via)
+		if d1 then return d1 end
+		local d2 = leg(via, L)
+		if d2 then return l1 + d2 end
+		return math.huge
+	end
+	return (leg(T, L)) or math.huge
+end
+
+-- body-sized sweeps along the predicted arc: root sphere, HEAD sphere (roofs / overhangs) and optionally legs.
+-- Ledge climbs (landing higher than a step) use the real motion: pressed against the wall until the body clears the
+-- lip, then sliding forward. edgeD = distance from takeoff to the landing's near edge along the route.
+local function arcClear(T, L, t, legs, steps, via, tau, rad, edgeD)
 	local N = steps or 5
 	tau = tau or 0
 	rad = rad or RADIUS
 	local legR = (rad < RADIUS) and math.max(rad - 0.05, 0.3) or 0.8
 	local len1 = via and flatDist(via, T) or 0
 	local total = via and (len1 + flatDist(L, via)) or flatDist(L, T)
-	local lip = (L.Y - T.Y > CONFIG.StepUp) and L.Y or nil
-	-- the collision body (root / torso) clears the lip when the FEET are about `lift` below it (limbs don't collide)
-	local lipFeet = lip and (lip - (S.lift or 0) - 0.4) or nil
+	local dhT = L.Y - T.Y
+	local lip = dhT > CONFIG.StepUp
+	local headOff = math.max((S.headUp or 2.4) - 0.6, 1.0)
+	local tClear, stopX = 0, math.huge
+	if lip then
+		local need = math.max(dhT - S.lift, 0) + 0.1
+		local disc = S.vy * S.vy - 2 * S.g * need
+		if disc < 0 then return false end
+		tClear = (S.vy - math.sqrt(disc)) / S.g
+		stopX = math.min(pathStop(T, L, via), math.max(0, (edgeD or (total - CONFIG.LandMargin)) - rad))
+	end
 	local aim = via or L
 	local hv = V3(aim.X - T.X, 0, aim.Z - T.Z)
 	local hdir = (hv.Magnitude > 1e-3) and hv.Unit or V3(0, 0, 1)
 	local y0 = -0.5 * S.g * tau * tau
+	local times = {}
+	for i = 0, N do times[#times + 1] = t * i / N end
+	if lip and tClear > 0.01 and tClear < t - 0.02 then
+		times[#times + 1] = tClear          -- sample the exact moment the body clears the lip
+		times[#times + 1] = tClear + 0.012
+		table.sort(times)
+	end
+	local last = #times
 	local prev
-	for i = 0, N do
-		local s = i / N
-		local time = t * s
-		-- distance along the horizontal path. Late jump: full speed while we fall for tau, then uniform.
+	for k = 1, last do
+		local time = times[k]
+		-- distance along the horizontal path
 		local dist
-		if tau > 0 then
+		if lip then
+			local x
+			if time <= tClear then
+				x = math.min(S.speed * time, stopX)
+			else
+				x = math.min(S.speed * tClear, stopX) + S.speed * (time - tClear)
+			end
+			dist = math.min(x, total)
+		elseif tau > 0 then
+			-- late jump: full speed while we fall for tau, then uniform
 			local early = S.speed * tau
 			if time <= tau then
 				dist = math.min(S.speed * time, total)
@@ -743,7 +799,7 @@ local function arcClear(T, L, t, legs, steps, via, tau, rad)
 				dist = math.min(total, early + (total - early) * (time - tau) / math.max(t - tau, 1e-3))
 			end
 		else
-			dist = total * s
+			dist = total * (time / t)
 		end
 		local px, pz
 		if via and total > 1e-4 then
@@ -767,12 +823,13 @@ local function arcClear(T, L, t, legs, steps, via, tau, rad)
 			y = y0 + S.vy * air - 0.5 * S.g * air * air
 		end
 		local p = V3(px, T.Y + S.rootH + y, pz)
-		if i >= 1 and i < N and hazardBox(CFrame.lookAt(p, p + hdir), V3((S.bodyL or 1.9) * 2, 4.8, (S.bodyF or 0.7) * 2)) then
+		if k >= 2 and k < last and hazardBox(CFrame.lookAt(p, p + hdir), V3((S.bodyL or 1.9) * 2, 4.8, (S.bodyF or 0.7) * 2)) then
 			return false
 		end
-		if prev and (not lipFeet or (prev.Y - S.rootH) >= lipFeet) then
+		if prev then
 			local d = p - prev
 			if sweep(prev, d, rad) or raycast(prev + V3(0, 2, 0), d)
+				or sweep(prev + V3(0, headOff, 0), d, 0.6)                         -- head: roofs / overhangs
 				or (legs and not lip and sweep(prev + V3(0, -1.8, 0), d, legR)) then return false end
 		end
 		prev = p
@@ -883,7 +940,43 @@ end
 
 local buildHop                              -- defined with the hazard code below
 
+local function pathClear(a, q, radius)
+	local d = q - a
+	if sweep(a + V3(0, MID_H, 0), d, radius) then return false end
+	if raycast(a + V3(0, HEAD_H, 0), d) then return false end
+	return true
+end
+
 local function narrowR() return math.max(S.bodyF or 0.7, 0.6) end -- body radius when turned sideways
+
+-- takeoff spots where a jump already failed are avoided for a while (so a re-plan picks another way)
+local function isBadTake(p)
+	local now = os.clock()
+	local list = S.bad
+	for i = #list, 1, -1 do
+		local b = list[i]
+		if b.exp < now then
+			table.remove(list, i)
+		elseif flatDist(b.pos, p) < 1.5 and math.abs(b.pos.Y - p.Y) < 2 then
+			return true
+		end
+	end
+	return false
+end
+
+-- is the floor continuous (walkable, not a hazard) on the straight line a -> b?
+local function floorLine(a, b)
+	local dx, dz = b.X - a.X, b.Z - a.Z
+	local n = math.max(1, math.ceil(math.sqrt(dx * dx + dz * dz)))
+	for i = 1, n do
+		local f = i / n
+		local r = raycast(V3(a.X + dx * f, a.Y + 1.2, a.Z + dz * f), V3(0, -2.6, 0))
+		if not r or r.Normal.Y < COS_SLOPE or math.abs(r.Position.Y - a.Y) > CONFIG.StepUp or isHazardHit(r) then
+			return false
+		end
+	end
+	return true
+end
 
 local buildJump
 do --[[blk]]
@@ -915,34 +1008,36 @@ buildJump = function(node, face, pt, m, allowCurve)
 		local T, edge = findTakeoff(P, dd, math.min(fd + 2, CONFIG.EdgeScan))
 		if T then
 			Ts[#Ts + 1] = T
-			local dh = L.Y - T.Y
-			local hd = flatDist(L, T)
-			local t = (hd >= 0.3) and fitJump(dh, hd, mEff) or nil
-			if t then
-				if arcClear(T, L, t) then
-					return {
-						kind = "jump", pos = L, inst = r.Instance, takeoff = T, inset = mEff,
-						cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + slipPen,
-					}
-				elseif CONFIG.NarrowSqueeze and CONFIG.FakeShiftlock
-					and arcClear(T, L, t, false, 6, nil, nil, narrowR()) then
-					-- the gap between walls is too tight for the body face-on: go through sideways
-					return {
-						kind = "jump", pos = L, inst = r.Instance, takeoff = T, narrow = true, inset = mEff,
-						cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + slipPen + 1.5,
-					}
+			if not isBadTake(T) then
+				local dh = L.Y - T.Y
+				local hd = flatDist(L, T)
+				local t = (hd >= 0.3) and fitJump(dh, hd, mEff) or nil
+				if t then
+					if arcClear(T, L, t, nil, nil, nil, nil, nil, hd - mEff) then
+						return {
+							kind = "jump", pos = L, inst = r.Instance, takeoff = T, inset = mEff,
+							cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + slipPen,
+						}
+					elseif CONFIG.NarrowSqueeze and CONFIG.FakeShiftlock
+						and arcClear(T, L, t, false, 6, nil, nil, narrowR(), hd - mEff) then
+						-- the gap between walls is too tight for the body face-on: go through sideways
+						return {
+							kind = "jump", pos = L, inst = r.Instance, takeoff = T, narrow = true, inset = mEff,
+							cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + slipPen + 1.5,
+						}
+					end
 				end
-			end
-			-- LATE JUMP: too far for an ordinary jump? run off the ledge and jump a moment later in mid-air.
-			-- The extra fall time carries us further forward (the jump start is "extended").
-			if edge and CONFIG.MaxLateJump > 0 and L.Y - edge.Y <= CONFIG.StepUp then
-				local need = flatDist(L, edge)
-				local tt, tau = fitReach(L.Y - edge.Y, need, true)
-				if tt and tau > 0 and need >= S.speed * tau + 0.5 and arcClear(edge, L, tt, false, 8, nil, tau) then
-					return {
-						kind = "jump", pos = L, inst = r.Instance, takeoff = edge, late = tau,
-						cost = flatDist(P, edge) + need + CONFIG.JumpPenalty + 1 + slipPen,
-					}
+				-- LATE JUMP: too far for an ordinary jump? run off the ledge and jump a moment later in mid-air.
+				-- The extra fall time carries us further forward (the jump start is "extended").
+				if edge and CONFIG.MaxLateJump > 0 and L.Y - edge.Y <= CONFIG.StepUp then
+					local need = flatDist(L, edge)
+					local tt, tau = fitReach(L.Y - edge.Y, need, true)
+					if tt and tau > 0 and need >= S.speed * tau + 0.5 and arcClear(edge, L, tt, false, 8, nil, tau) then
+						return {
+							kind = "jump", pos = L, inst = r.Instance, takeoff = edge, late = tau,
+							cost = flatDist(P, edge) + need + CONFIG.JumpPenalty + 1 + slipPen,
+						}
+					end
 				end
 			end
 		end
@@ -956,7 +1051,7 @@ buildJump = function(node, face, pt, m, allowCurve)
 		local dh = L.Y - T.Y
 		local tv = V3(L.X - T.X, 0, L.Z - T.Z)
 		local hd = tv.Magnitude
-		if hd >= 1.0 then
+		if hd >= 1.0 and not isBadTake(T) then
 			local fwd = tv / hd
 			local perp = V3(-fwd.Z, 0, fwd.X)
 			for _, off in ipairs(CURVE_OFFS) do
@@ -965,7 +1060,7 @@ buildJump = function(node, face, pt, m, allowCurve)
 						local W = T + fwd * (hd * frac) + perp * (off * side)
 						local plen = flatDist(T, W) + flatDist(W, L)
 						local t = fitJump(dh, plen, mEff)
-						if t and arcClear(T, L, t, true, 8, W) then
+						if t and arcClear(T, L, t, true, 8, W, nil, nil, plen - mEff) then
 							return {
 								kind = "jump", pos = L, inst = r.Instance, takeoff = T, via = W, inset = mEff,
 								cost = flatDist(P, T) + plen + CONFIG.JumpPenalty + 3 + slipPen,
@@ -974,6 +1069,75 @@ buildJump = function(node, face, pt, m, allowCurve)
 					end
 				end
 			end
+		end
+	end
+
+	-- 2b. BACK-OUT: jump and drift BACKWARD (away from the wall / out from under the roof) while the body keeps facing
+	--     the ledge, then come forward over the lip. Path T -> W (behind T, optionally a bit sideways) -> L.
+	--     Nothing is assumed: the head / body sweeps at sampled moments of the arc (including the exact moment the body
+	--     clears the lip) and the speed * air time budget decide whether it works for THIS roof and THIS player.
+	if (L.Y - P.Y) > CONFIG.StepUp then
+		for i = 1, math.min(#Ts, 2) do
+			local T = Ts[i]
+			if not isBadTake(T) then
+				local dh = L.Y - T.Y
+				local tv = V3(L.X - T.X, 0, L.Z - T.Z)
+				local hd = tv.Magnitude
+				if hd >= 0.3 then
+					local fwd = tv / hd
+					local perp = V3(-fwd.Z, 0, fwd.X)
+					for _, back in ipairs({ 1, 1.8, 2.6, 3.6 }) do
+						for _, side in ipairs({ 0, 1.2, -1.2, 2.5, -2.5 }) do
+							local W = T - fwd * back + perp * side
+							local plen = flatDist(T, W) + flatDist(W, L)
+							local t = fitJump(dh, plen, mEff)
+							if t and arcClear(T, L, t, nil, 10, W, nil, nil, plen - mEff) then
+								return {
+									kind = "jump", pos = L, inst = r.Instance, takeoff = T, via = W, backout = true, inset = mEff,
+									cost = flatDist(P, T) + plen + CONFIG.JumpPenalty + 3.5 + slipPen,
+								}
+							end
+						end
+						checkYield()
+					end
+				end
+			end
+		end
+	end
+
+	-- 3. HEADROOM / SIDE-STEP: the straight takeoff can sit under a roof (the head would bump it). Look for a takeoff
+	--    spot with open air above it: slide along the wall and back away from it. While jumping the body keeps
+	--    facing the ledge (fake shiftlock), so the thin side leads and we may strafe / walk backward in the air.
+	if (L.Y - P.Y) > CONFIG.StepUp and Ts[1] and S.slideN < 40 then
+		S.slideN += 1
+		local T0 = Ts[1]
+		local perp = V3(-dir.Z, 0, dir.X)
+		for _, back in ipairs({ 0, 1.5, 3 }) do
+			for _, side in ipairs({ 0, 1.5, -1.5, 3, -3, 5, -5, 7, -7 }) do
+				if back > 0 or side ~= 0 then
+					local Q = T0 - dir * back + perp * side
+					local g = raycast(V3(Q.X, T0.Y + 1.2, Q.Z), V3(0, -2.6, 0))
+					if g and g.Normal.Y >= COS_SLOPE and math.abs(g.Position.Y - T0.Y) <= 0.6 and not isHazardHit(g) then
+						local Qp = g.Position
+						if not isBadTake(Qp) and not hazardAtBody(Qp) and floorLine(P, Qp) and pathClear(P, Qp, RADIUS) then
+							local r2 = snapLanding(face, nearestOnFace(face, Qp, mEff))
+							if r2 then
+								local L2 = r2.Position
+								local hd2 = flatDist(L2, Qp)
+								local t2 = (hd2 >= 0.3) and fitJump(L2.Y - Qp.Y, hd2, mEff) or nil
+								if t2 and arcClear(Qp, L2, t2, nil, 8, nil, nil, nil, hd2 - mEff)
+									and not hazardOriented(L2, V3(L2.X - Qp.X, 0, L2.Z - Qp.Z).Unit) then
+									return {
+										kind = "jump", pos = L2, inst = r2.Instance, takeoff = Qp, inset = mEff,
+										cost = flatDist(P, Qp) + hd2 + CONFIG.JumpPenalty + 2 + slipPen,
+									}
+								end
+							end
+						end
+					end
+				end
+			end
+			checkYield()
 		end
 	end
 	return nil
@@ -1190,13 +1354,6 @@ end
 end --[[blk]]
 
 ---------------------------------------------------------------- walk edges
-local function pathClear(a, q, radius)
-	local d = q - a
-	if sweep(a + V3(0, MID_H, 0), d, radius) then return false end
-	if raycast(a + V3(0, HEAD_H, 0), d) then return false end
-	return true
-end
-
 local function rampOK(a, b)
 	local mx, mz, my = (a.X + b.X) / 2, (a.Z + b.Z) / 2, (a.Y + b.Y) / 2
 	local r = raycast(V3(mx, my + 1.2, mz), V3(0, -2.4, 0))
@@ -1572,6 +1729,7 @@ local function findPath(startPos, startInst, goal, weight)
 	jumpExpansions = 0
 	fallExpansions = 0
 	vaultExpansions = 0
+	S.slideN = 0
 
 	local function getNode(pos, inst)
 		local k = keyOf(pos)
@@ -1691,12 +1849,15 @@ local function buildSteps(endNode, goal, complete, startPos)
 				dir = fd.Magnitude > 0.01 and fd.Unit or V3(0, 0, 1),
 			}
 		elseif e.kind == "jump" then
-			local d = flat((e.via or e.pos) - e.takeoff)
+			local dvia = flat((e.via or e.pos) - e.takeoff)
+			local fz = flat(e.pos - e.takeoff)
+			local d = e.backout and fz or dvia
 			steps[#steps + 1] = {
 				kind = "jump", takeoff = e.takeoff, land = e.pos,
 				dir = d.Magnitude > 0.01 and d.Unit or V3(0, 0, 1),
 				lip = (e.pos.Y - e.takeoff.Y) > CONFIG.StepUp, vault = e.vault, runup = e.runup, via = e.via, late = e.late, narrow = e.narrow,
-				inset = e.inset,
+				inset = e.inset, face = (fz.Magnitude > 0.01) and fz.Unit or nil,
+				backout = e.backout, moveDir = (dvia.Magnitude > 0.01) and dvia.Unit or nil,
 			}
 		elseif e.drop then
 			-- walk off a ledge and fall (any depth): handled like a jump with no jump, steered to the landing
@@ -1805,11 +1966,15 @@ local function doJump(hum)
 	pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
 end
 
--- a ledge climb failed: assume the legs-don't-collide lift is a bit smaller than we thought (self-correcting)
-local function liftFailed(step)
-	if step and step.lip and (S.liftBase or 0) > 0 then
-		S.liftPenalty = math.min((S.liftPenalty or 0) + 0.5, S.liftBase)
+-- a jump failed: avoid that takeoff spot for a while; a failed LEDGE climb also lowers the lift estimate a bit
+local function jumpFailed(step, keepLift)
+	if not step or step.fall then return end
+	S.bad[#S.bad + 1] = { pos = step.takeoff, exp = os.clock() + 45 }
+	if not keepLift and step.lip and (S.liftBase or 0) > 0 then
+		S.liftPenalty = math.min((S.liftPenalty or 0) + 0.5, math.min(S.liftBase, 1.0))
 		dbg(string.format("ledge climb failed -> lift estimate lowered to %.2f", math.max(0, S.liftBase - S.liftPenalty)))
+	else
+		dbg("jump failed -> takeoff spot avoided for 45 s")
 	end
 end
 
@@ -2290,6 +2455,7 @@ local function onStep(dt)
 			local toT = V3(T.X - feet.X, 0, T.Z - feet.Z)
 			local d = toT.Magnitude
 			local along = toT:Dot(step.dir)
+			local lat = math.sqrt(math.max(0, d * d - along * along)) -- sideways distance from the takeoff line
 			local retreat = false
 			if step.vault and not step.ready then
 				if along >= (step.runup or 1.4) - 0.6 then step.ready = true else retreat = true end
@@ -2325,7 +2491,7 @@ local function onStep(dt)
 				if step.phase == "run" and os.clock() - step.t0 > 8 then
 					replan(f, "run-up timeout") return
 				end
-			elseif not retreat and grounded and along <= math.max(0.2, hs * dt * 1.25) then
+			elseif not retreat and grounded and along <= math.max(0.2, hs * dt * 1.25) and lat <= 1.0 then
 				-- re-check with the REAL position: if we got shoved off the takeoff line, don't jump short
 				local dhNow = L.Y - feet.Y
 				local plen = step.via and (flatDist(feet, step.via) + flatDist(step.via, L)) or flatDist(feet, L)
@@ -2339,6 +2505,15 @@ local function onStep(dt)
 				end
 				if not fits then
 					replan(f, "off the takeoff line", true) return
+				end
+				if step.lip and not step.backout then
+					-- roof check: will our head hit something while we rise past the lip?
+					local rise = math.max(0, dhNow - S.lift) + 0.3
+					local headOff = math.max((S.headUp or 2.4) - 0.6, 1.0)
+					if sweep(pos + V3(0, headOff, 0), V3(0, rise, 0), 0.6) then
+						jumpFailed(step, true)
+						replan(f, "roof above takeoff", true) return
+					end
 				end
 				doJump(hum)
 				step.phase, step.t0, step.left, step.tries = "air", os.clock(), false, 1
@@ -2364,9 +2539,13 @@ local function onStep(dt)
 			local elapsed = os.clock() - step.t0
 
 			if not step.left then
-				hum:Move(step.dir, false)
+				hum:Move(step.moveDir or step.dir, false)
+				if CONFIG.FakeShiftlock then
+					local f0 = step.face or step.dir
+					Face.target = step.narrow and V3(-f0.Z, 0, f0.X) or f0
+				end
 				if elapsed > 0.35 then
-					if step.tries >= 3 then replan(f, "jump failed") return end
+					if step.tries >= 3 then jumpFailed(step) replan(f, "jump failed") return end
 					doJump(hum)
 					step.tries += 1
 					step.t0 = os.clock()
@@ -2385,8 +2564,13 @@ local function onStep(dt)
 				if step.via and not step.viaDone then
 					local Vw = step.via
 					local toV = V3(Vw.X - pos.X, 0, Vw.Z - pos.Z)
-					local passed = ((pos.X - Vw.X) * (L.X - Vw.X) + (pos.Z - Vw.Z) * (L.Z - Vw.Z)) > 0
-					if toV.Magnitude < 1.2 or passed then
+					local passed
+					if step.backout then -- past the back waypoint, measured along the way we drifted
+						passed = ((pos.X - Vw.X) * (Vw.X - T.X) + (pos.Z - Vw.Z) * (Vw.Z - T.Z)) > 0
+					else
+						passed = ((pos.X - Vw.X) * (L.X - Vw.X) + (pos.Z - Vw.Z) * (L.Z - Vw.Z)) > 0
+					end
+					if toV.Magnitude < (step.backout and 0.4 or 1.2) or passed then
 						step.viaDone = true
 					else
 						tgt, extra = Vw, flatDist(Vw, L)
@@ -2403,11 +2587,16 @@ local function onStep(dt)
 				else
 					throttle = 1
 				end
+				if step.backout and not step.viaDone then throttle = 1 end -- drift back at full speed (the plan counted on it)
 				-- still climbing past the lip: keep pushing toward the ledge so we slide onto it the moment we clear
 				if step.lip and rd > 0.6 and feet.Y + lift < L.Y + 0.1 then throttle = math.max(throttle, 0.9) end
 				local mv = (rdDir > 0.05) and (rem / rdDir) or step.dir
 				hum:Move(mv * throttle, false)
-				if CONFIG.FakeShiftlock then Face.target = step.narrow and V3(-mv.Z, 0, mv.X) or mv end
+				if CONFIG.FakeShiftlock then
+					-- ledge jumps: keep FACING THE LEDGE while the movement direction stays free (strafe / walk backward)
+					local fd0 = (step.lip and step.face) or mv
+					Face.target = step.narrow and V3(-fd0.Z, 0, fd0.X) or fd0
+				end
 				if CONFIG.VelocityAssist then
 					local v = mv * throttle * speed
 					root.AssemblyLinearVelocity = V3(v.X, vy, v.Z)
@@ -2416,13 +2605,13 @@ local function onStep(dt)
 				if grounded and vy < 5 and elapsed > 0.12 then
 					-- verify we really are on the landing (a failed climb falls back to the start level)
 					if flatDist(feet, L) > 3.5 or math.abs(feet.Y - L.Y) > 2.5 then
-						liftFailed(step)
+						jumpFailed(step)
 						replan(f, "missed landing") return
 					end
 					f.prev = L
 					f.i += 1
 				elseif elapsed > 6 + 1.5 * math.sqrt(2 * math.max(0, T.Y - L.Y) / g) then
-					liftFailed(step)
+					jumpFailed(step)
 					replan(f, "air timeout") return
 				end
 			end
@@ -2881,4 +3070,4 @@ refreshFilter()
 refreshButton()
 if player.Character then task.spawn(setupLearning, player.Character) end
 notify("Advanced Pathfinder by Spvico - tap AP to enable", WHITE)
-print("[Advanced Pathfinder] Created by Spvico (v1.1)")
+print("[Advanced Pathfinder] Created by Spvico (v1.2)")
