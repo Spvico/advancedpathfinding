@@ -385,10 +385,6 @@ end
 --   the same colour + material blamed twice = that look is deadly
 --   a "hazard" you stand on / touch for 3 s without taking damage = false alarm, cleared automatically
 -- Everything is automatic: no marking, no setup. Detected hazards get a red outline (ShowHazards).
-local HAZ_STRONG = { "kill", "lava", "death", "deadly", "lethal", "damage", "dmg", "hurt", "harm", "hazard",
-	"danger", "spike", "trap", "acid", "poison", "toxic", "fatal", "laser", "burn", "zap", "magma" }
-local HAZ_WEAK = { "fire", "saw", "blade", "shock", "electr", "explo", "bomb", "dead", "pain", "oof", "thorn", "flame" }
-local SAFE_WORDS = { "safe", "nokill", "antikill", "nodamage", "checkpoint", "spawn", "heal", "deco" }
 
 local learned = env.__APLearned or setmetatable({}, { __mode = "k" }) -- part -> blame points
 env.__APLearned = learned
@@ -448,7 +444,13 @@ local function setMark(part, on)
 	end
 end
 
-local function textScore(str)
+local textScore
+do --[[blk]]
+local HAZ_STRONG = { "kill", "lava", "death", "deadly", "lethal", "damage", "dmg", "hurt", "harm", "hazard",
+	"danger", "spike", "trap", "acid", "poison", "toxic", "fatal", "laser", "burn", "zap", "magma" }
+local HAZ_WEAK = { "fire", "saw", "blade", "shock", "electr", "explo", "bomb", "dead", "pain", "oof", "thorn", "flame" }
+local SAFE_WORDS = { "safe", "nokill", "antikill", "nodamage", "checkpoint", "spawn", "heal", "deco" }
+textScore = function(str)
 	str = string.lower(str)
 	if string.find(str, "unsafe", 1, true) then return 3 end
 	for _, w in ipairs(SAFE_WORDS) do
@@ -462,6 +464,7 @@ local function textScore(str)
 	end
 	return 0
 end
+end --[[blk]]
 
 local function signature(part) -- colour + material (generalises to "all parts that look like this")
 	local c = part.Color
@@ -629,8 +632,10 @@ end
 
 ---------------------------------------------------------------- slippery surfaces
 -- friction = the part's CustomPhysicalProperties, else the material default (Ice 0.02, Glacier 0.05, ...)
+local matFriction
+do --[[blk]]
 local matCache = {}
-local function matFriction(mat)
+matFriction = function(mat)
 	local f = matCache[mat]
 	if f == nil then
 		local ok, pp = pcall(PhysicalProperties.new, mat)
@@ -639,9 +644,12 @@ local function matFriction(mat)
 	end
 	return f
 end
+end --[[blk]]
 
+local frictionOfPart
+do --[[blk]]
 local frictionCache = setmetatable({}, { __mode = "k" })
-local function frictionOfPart(part)
+frictionOfPart = function(part)
 	local f = frictionCache[part]
 	if f == nil then
 		local cp = part.CustomPhysicalProperties
@@ -650,6 +658,7 @@ local function frictionOfPart(part)
 	end
 	return f
 end
+end --[[blk]]
 
 local function isSlipperyPart(part)
 	return CONFIG.IceSupport and part ~= nil and frictionOfPart(part) < CONFIG.SlipperyFriction
@@ -771,7 +780,6 @@ local function arcClear(T, L, t, legs, steps, via, tau, rad)
 	return true
 end
 
-local LERPS = { 0, 0.3, 0.6, 1 }
 local faceCache = {}
 local climbChecks = 0
 local climbSeen = {}
@@ -833,7 +841,7 @@ end
 -- real surface under the bounding-box point (handles wavy / bumpy tops); falls back toward the center
 local function snapLanding(face, pt)
 	local win = math.min(face.thick, 6)
-	for _, f in ipairs(LERPS) do
+	for _, f in ipairs({ 0, 0.3, 0.6, 1 }) do
 		local q = pt:Lerp(face.center, f)
 		local r = raycast(V3(q.X, q.Y + 1.5, q.Z), V3(0, -(1.5 + win), 0))
 		if r and r.Normal.Y >= COS_LAND and r.Position.Y <= q.Y + 0.6 and not isHazardHit(r) then return r end
@@ -873,14 +881,16 @@ local function fitJump(dh, dist, mEff)
 	return nil
 end
 
-local FAN = { 0, 0.4, -0.4, 0.8, -0.8 } -- takeoff search directions around the straight line to the landing (rad)
-local CURVE_OFFS = { 2.2, 3.6, 5.4, 7.5 }   -- how far the arch swings out sideways (studs)
-local CURVE_FRACS = { 0.5, 0.3, 0.7 }       -- where along the straight line the swing is widest
 local buildHop                              -- defined with the hazard code below
 
 local function narrowR() return math.max(S.bodyF or 0.7, 0.6) end -- body radius when turned sideways
 
-local function buildJump(node, face, pt, m, allowCurve)
+local buildJump
+do --[[blk]]
+local FAN = { 0, 0.4, -0.4, 0.8, -0.8 } -- takeoff search directions around the straight line to the landing (rad)
+local CURVE_OFFS = { 2.2, 3.6, 5.4, 7.5 }   -- how far the arch swings out sideways (studs)
+local CURVE_FRACS = { 0.5, 0.3, 0.7 }       -- where along the straight line the swing is widest
+buildJump = function(node, face, pt, m, allowCurve)
 	local P = node.pos
 	local r = snapLanding(face, pt)
 	if not r then return nil end
@@ -968,6 +978,7 @@ local function buildJump(node, face, pt, m, allowCurve)
 	end
 	return nil
 end
+end --[[blk]]
 
 local function expandJumps(node, out, climbOnly)
 	if S.vyReal < 10 or S.speed < 1 then return end
@@ -1021,6 +1032,8 @@ end
 --     We don't know how those are scripted, so we push into them and keep jumping, and WATCH the height: if we
 --     are not gaining height they are marked bad for a while and we re-plan (rung ladders are also reachable
 --     through the normal jump logic, custom climbs cost more so real jump paths win).
+local expandClimbs
+do --[[blk]]
 local LADDER_WORDS = { "ladder", "climb", "vine" }
 local function ladderWord(str)
 	str = string.lower(str)
@@ -1057,7 +1070,7 @@ local function objBox(obj)
 	return obj.CFrame, obj.Size
 end
 
-local function expandClimbs(node, out)
+expandClimbs = function(node, out)
 	if climbChecks >= CONFIG.MaxClimbChecks then return end
 	local P = node.pos
 	-- one scan per 3-stud cell is plenty (landing nodes always scan)
@@ -1118,14 +1131,17 @@ local function expandClimbs(node, out)
 		end
 	end
 end
+end --[[blk]]
 
 -- Falls onto ANY ground (terrain included). For every direction we sample the ground below at growing
 -- distances from the ledge; each sample's own depth gives its own air time, so the horizontal reach is
 -- counted per sample:   t = (vy + sqrt(vy^2 + 2*g*depth)) / g,   reach = WalkSpeed * t.   Deeper = farther.
+local expandFalls
+do --[[blk]]
 local FALL_DIRS = 8
 local FALL_RADII = { 2.5, 4, 6, 9, 13, 18, 25, 35, 50, 70, 100 }
 
-local function expandFalls(node, out)
+expandFalls = function(node, out)
 	if S.vyReal < 10 or S.speed < 1 then return end
 	if fallExpansions >= CONFIG.MaxFallExpansions then return end
 	fallExpansions += 1
@@ -1171,6 +1187,7 @@ local function expandFalls(node, out)
 		checkYield()
 	end
 end
+end --[[blk]]
 
 ---------------------------------------------------------------- walk edges
 local function pathClear(a, q, radius)
@@ -1312,6 +1329,7 @@ end
 --   2. take off just before S0 (or from the ledge before a gap that comes first), land just after S1
 --   3. ask the jump physics whether that fits: normal jump, or a LATE jump (run off the ledge, jump a moment
 --      later = longer reach). Sweep the arc (body + legs). If it fits -> jump, if not -> not possible.
+do --[[blk]]
 local BODY_OFF = 2.65 -- body box centre above the feet
 
 -- where along the ray (origin o, unit direction d) is the body CENTRE inside this part's box grown by the hitbox?
@@ -1408,6 +1426,7 @@ buildHop = function(node, d)
 	end
 	return nil
 end
+end --[[blk]]
 
 local function expandHops(node, out, dirs)
 	if S.vyReal < 10 or S.speed < 1 then return end
@@ -1993,7 +2012,8 @@ end
 --  * pure pursuit: aim at a point ahead ON the route line, so sideways slide gets pulled back to the line
 --  * speed plan: v = sqrt(vExit^2 + 2*a*dist) -> slow down just enough to make the corner / stop in time
 --  * steer on velocity ERROR: pushing against our own slide is what actually brakes us
-local function iceSteer(hum, root, f, step, fl, dist, last, speed, dt, feet)
+local Ice = {}
+function Ice.steer(hum, root, f, step, fl, dist, last, speed, dt, feet)
 	local v = root.AssemblyLinearVelocity
 	local hv = V3(v.X, 0, v.Z)
 
@@ -2041,7 +2061,7 @@ local function iceSteer(hum, root, f, step, fl, dist, last, speed, dt, feet)
 end
 
 -- run-up to a takeoff point on ice: arrive at full speed with the velocity already pointing along the jump
-local function iceRunSteer(hum, root, toT, d, dir, speed)
+function Ice.runSteer(hum, root, toT, d, dir, speed)
 	local v = root.AssemblyLinearVelocity
 	local k = math.clamp(d / 3, 0, 1)
 	local aim = ((d > 0.05) and (toT / d) * k or Vector3.zero) + dir * (1 - k)
@@ -2051,7 +2071,7 @@ local function iceRunSteer(hum, root, toT, d, dir, speed)
 end
 
 -- is the ground under us slippery? (cached, 10 Hz)
-local function groundSlip(f, root)
+function Ice.groundSlip(f, root)
 	local now = os.clock()
 	if now - (f.slipT or 0) > 0.1 then
 		f.slipT = now
@@ -2114,7 +2134,7 @@ local function onStep(dt)
 		end
 	end
 
-	local slip = CONFIG.IceSupport and grounded and groundSlip(f, root)
+	local slip = CONFIG.IceSupport and grounded and Ice.groundSlip(f, root)
 
 	-- walking waypoints (never stops between them = no momentum loss)
 	while step and step.kind == "walk" do
@@ -2136,7 +2156,7 @@ local function onStep(dt)
 			if dist <= 0.05 then
 				hum:Move(Vector3.zero, false)
 			elseif slip then
-				iceSteer(hum, root, f, step, fl, dist, last, speed, dt, feet)
+				Ice.steer(hum, root, f, step, fl, dist, last, speed, dt, feet)
 			else
 				hum:Move(fl / dist, false)
 			end
@@ -2279,7 +2299,7 @@ local function onStep(dt)
 				local R = V3(T.X - step.dir.X * ru - feet.X, 0, T.Z - step.dir.Z * ru - feet.Z)
 				hum:Move((R.Magnitude > 0.05) and R.Unit or Vector3.zero, false)
 			elseif slip and not step.passed then
-				iceRunSteer(hum, root, toT, d, step.dir, speed)
+				Ice.runSteer(hum, root, toT, d, step.dir, speed)
 			else
 				-- once we have passed the takeoff point (late jump) keep running FORWARD, never back toward it
 				hum:Move((d > 0.6 and not step.passed) and (toT / d) or step.dir, false)
@@ -2483,7 +2503,7 @@ end)
 
 ---------------------------------------------------------------- toggle button (tap / hold-drag)
 local BIND = "AdvancedPathfinderStep"
-local pressInput, pressT, dragMode, dragStartPtr, dragStartPos
+local pressInput, pressT, dragMode, dragStartPtr
 local dragStartUDim
 
 -- Pointer in the SAME space as AbsolutePosition (full-screen GUI space). Touch input.Position excludes the
