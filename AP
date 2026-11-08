@@ -1,5 +1,5 @@
 --[[
-	ADVANCED PATHFINDER v1.3
+	ADVANCED PATHFINDER v1.5
 	Created by Spvico
 
 	Custom A* pathfinder (NO PathfindingService) with physics-aware obby jumping.
@@ -16,6 +16,18 @@
 	  - run-up never stops: Move() stays active, jump is fired while still running
 	  - in the air, throttle is recomputed EVERY FRAME from (distance left / time left)
 	    so you touch down exactly on the landing point without braking before the jump
+
+	v1.5: HITBOX-AWARE JUMPS.
+	  - JUMP EXTENDER: the humanoid floor sensor casts from the root part's centre AND its four bottom corners, so you stay
+	    "grounded" until the WHOLE root part is over the edge. Turned sideways (fake shiftlock) the long side of the root part
+	    lies along the jump, so we may take off up to ~1 stud PAST the edge (thin side leading only gives ~0.5). The planner
+	    uses it when a normal takeoff is too short, the follower turns sideways, and the amount is LEARNED from where
+	    you actually leave the ground (and reduced if such a jump fails).
+	  - Exact ledge position: the takeoff edge is bisected (it was only known to 0.5 studs), takeoff inset 0.3 -> 0.1.
+	  - Landing only needs the root CENTRE past the far edge: extra, tighter landing margins (0.35) are tried when the
+	    safe ones (1.2 / 0.7) are out of reach. Reach safety 0.95 -> 0.97.
+	  - Narrow walkways: the 2-stud walk lattice could skip a 1-2 stud wide strip completely, so nudged cells are tried.
+	  - Walked off the ledge a hair before the takeoff point -> jump immediately (still inside the coyote window).
 
 	v1.3: LADDERS BY SHAPE. Names / tags / attributes are NOT used any more. A stack of >= 3 thin walkable bars one above
 	      another (gaps within this player's jump range) is a rung ladder; TrussPart is climbable by class. The climb
@@ -81,8 +93,8 @@ local CONFIG = {
 	MaxJumpExpansions = 800,
 	LandMargin        = 1.2, -- landing point is pulled this far inside the part edge
 	EdgeScan          = 5,   -- how far from a node we look for the takeoff edge
-	TakeoffInset      = 0.3,
-	ReachSafety       = 0.95,
+	TakeoffInset      = 0.1,
+	ReachSafety       = 0.97,
 	HeightSafety      = 0.985,
 	VelocityAssist    = false, -- true = also force air velocity (use if Move() throttle is ignored)
 	ShowPath          = true,
@@ -93,6 +105,9 @@ local CONFIG = {
 
 	LiftFactor        = 0.8,  -- ledge climbing: how much of the "legs don't collide" lift (root height minus root
 	                          -- half height, ~2 studs) we count on. 0 = old behaviour (feet must clear the lip)
+	JumpExtender      = true, -- take off up to (root half-length) past the edge by turning sideways (needs FakeShiftlock)
+	ExtendFactor      = 0.85, -- fraction of the root half-length we trust at first (then learned)
+	NarrowSnap        = true, -- also try nudged walk cells so 1-2 stud wide strips are found
 	MinLiftWindow     = 0.06, -- seconds the torso must stay above the lip to slide onto the ledge
 	Debug             = true, -- prints jump stats / failure reasons to the output (F9 console)
 
@@ -191,7 +206,7 @@ local hazRejects = 0
 local lastHazardPart = nil
 local S = {
 	g = 196.2, vy = 50, vyReal = 50, speed = 16, rootH = 3, maxH = 6.4, iceAccel = 10, bodyL = 1.9, bodyF = 0.7,
-	rootHalf = 1, liftBase = 1.6, lift = 1.6, liftPenalty = 0, headUp = 2.4, bad = {}, slideN = 0, rungs = {},
+	rootHalf = 1, liftBase = 1.6, lift = 1.6, liftPenalty = 0, headUp = 2.4, bad = {}, slideN = 0, rungs = {}, halfW = 1, halfD = 0.5, extend = 0,
 }
 local CANCEL = {}
 
@@ -342,6 +357,13 @@ local function readStats(hum, root)
 	S.rootHalf = root.Size.Y / 2
 	S.liftBase = math.clamp(S.rootH - S.rootHalf, 0, 2.6) * CONFIG.LiftFactor
 	S.lift = math.max(0, S.liftBase - (S.liftPenalty or 0))
+	-- JUMP EXTENDER: the floor sensor fires from the root part's centre and its bottom corners, so we stay grounded until
+	-- the whole root part is over the edge. Turned sideways its long side (halfW each way) lies along the jump.
+	S.halfW, S.halfD = root.Size.X / 2, root.Size.Z / 2
+	S.extend = 0
+	if CONFIG.JumpExtender and CONFIG.FakeShiftlock then
+		S.extend = math.clamp(S.extLearn or (S.halfW * CONFIG.ExtendFactor), 0, S.halfW)
+	end
 	-- measured hitbox (lateral / front-back half sizes incl. arms + accessories)
 	local okb, ext = pcall(function() return hum.Parent:GetExtentsSize() end)
 	if okb and ext then
@@ -709,6 +731,22 @@ local function findTakeoff(P, dir, maxLen)
 		if r and r.Normal.Y >= COS_SLOPE and not isHazardHit(r) then
 			lastP = r.Position
 		else
+			if not (r and isHazardHit(r)) then
+				-- the samples are 0.5 studs apart: find the TRUE edge between the last floor sample and this one
+				local loD, hiD = (k - 1) * 0.5, k * 0.5
+				local edgeP = lastP
+				for _ = 1, 5 do
+					local midD = (loD + hiD) * 0.5
+					local q = P + dir * midD
+					local rr = raycast(V3(q.X, lastP.Y + 1.2, q.Z), V3(0, -2.6, 0))
+					if rr and rr.Normal.Y >= COS_SLOPE and not isHazardHit(rr) then
+						loD, edgeP = midD, rr.Position
+					else
+						hiD = midD
+					end
+				end
+				lastP = edgeP
+			end
 			local inset = CONFIG.TakeoffInset
 			if r and isHazardHit(r) then inset = CONFIG.HazardClearance end -- ledge is a hazard: keep body clear of it
 			local T = lastP - dir * inset
@@ -938,7 +976,7 @@ local function fitJump(dh, dist, mEff)
 		return liftFit(dh, math.max(0, dist - mEff))
 	end
 	local t = flightTime(dh)
-	if t and dist <= S.speed * t * CONFIG.ReachSafety - 0.2 then return t end
+	if t and dist <= S.speed * t * CONFIG.ReachSafety - 0.1 then return t end
 	return nil
 end
 
@@ -1029,6 +1067,23 @@ buildJump = function(node, face, pt, m, allowCurve)
 							kind = "jump", pos = L, inst = r.Instance, takeoff = T, narrow = true, inset = mEff,
 							cost = flatDist(P, T) + hd + CONFIG.JumpPenalty + slipPen + 1.5,
 						}
+					end
+				end
+				-- JUMP EXTENDER: the ordinary takeoff is too short. Turned sideways the root part's long side lies along the
+				-- jump and the floor sensor keeps us "grounded" until the whole root part is over the edge, so we can
+				-- leave the ground with the centre up to S.extend PAST the edge.
+				if CONFIG.JumpExtender and CONFIG.FakeShiftlock and edge and S.extend > 0.1 and dh <= CONFIG.StepUp then
+					local Tx = edge + dd * (S.extend - CONFIG.TakeoffInset)
+					Tx = V3(Tx.X, T.Y, Tx.Z)
+					if not isBadTake(Tx) then
+						local hdx = flatDist(L, Tx)
+						local tx = (hdx >= 0.3) and fitJump(L.Y - Tx.Y, hdx, mEff) or nil
+						if tx and arcClear(Tx, L, tx, nil, nil, nil, nil, nil, hdx - mEff) then
+							return {
+								kind = "jump", pos = L, inst = r.Instance, takeoff = Tx, ext = true, edgePt = edge, inset = mEff,
+								cost = flatDist(P, Tx) + hdx + CONFIG.JumpPenalty + slipPen + 0.5,
+							}
+						end
 					end
 				end
 				-- LATE JUMP: too far for an ordinary jump? run off the ledge and jump a moment later in mid-air.
@@ -1178,7 +1233,7 @@ local function expandJumps(node, out, climbOnly)
 							if raycast(V3(mid.X, P.Y + 1.2, mid.Z), V3(0, -2.4, 0)) then skip = true end
 						end
 						if not skip then
-							cands[#cands + 1] = { pt = pt, pt2 = nearestOnFace(face, P, 0.7), face = face, score = heur(pt, goalPos) + fd * 0.25 }
+							cands[#cands + 1] = { pt = pt, pt2 = nearestOnFace(face, P, 0.7), pt3 = nearestOnFace(face, P, 0.35), face = face, score = heur(pt, goalPos) + fd * 0.25 }
 						end
 					end
 				end
@@ -1189,6 +1244,7 @@ local function expandJumps(node, out, climbOnly)
 	for i = 1, math.min(#cands, CONFIG.MaxJumpCandidates) do
 		local e = buildJump(node, cands[i].face, cands[i].pt, CONFIG.LandMargin, i <= 3)
 		if not e then e = buildJump(node, cands[i].face, cands[i].pt2, 0.7, i <= 3) end
+		if not e then e = buildJump(node, cands[i].face, cands[i].pt3, 0.35, i <= 3) end
 		if e then out[#out + 1] = e end
 		checkYield()
 	end
@@ -1697,7 +1753,7 @@ local function expandHops(node, out, dirs)
 end
 
 -- returns pos, inst, cost, isDrop   |   nil, reason ("gap" / "block")
-local function tryWalk(a, tx, tz)
+local function tryWalk1(a, tx, tz)
 	local ay = a.Y
 	local su = CONFIG.StepUp
 	local down = math.min(su + 0.3 + CONFIG.MaxFall, ay + su + 0.3 - (Workspace.FallenPartsDestroyHeight + 15))
@@ -1750,6 +1806,22 @@ local function tryWalk(a, tx, tz)
 		end
 	end
 	return nil, (r == nil) and "gap" or "block"
+end
+
+-- A 1-2 stud wide walkway can fall between the cells of the 2-stud lattice. When a cell is "gap", also try cells nudged
+-- sideways so the strip is found (we then slide along it facing the wall, thin side across).
+local function tryWalk(a, tx, tz)
+	local b, inst, cost, drop, narrow = tryWalk1(a, tx, tz)
+	if b or inst ~= "gap" or not CONFIG.NarrowSnap then return b, inst, cost, drop, narrow end
+	local dx, dz = tx - a.X, tz - a.Z
+	local l = math.sqrt(dx * dx + dz * dz)
+	if l < 0.1 then return b, inst, cost, drop, narrow end
+	local px, pz = -dz / l, dx / l
+	for _, off in ipairs({ 0.8, -0.8 }) do
+		local b2, i2, c2, d2, n2 = tryWalk1(a, tx + px * off, tz + pz * off)
+		if b2 then return b2, i2, c2, d2, n2 end
+	end
+	return b, inst, cost, drop, narrow
 end
 
 local function expandWalk(node, out)
@@ -1953,7 +2025,7 @@ local function buildSteps(endNode, goal, complete, startPos)
 			steps[#steps + 1] = {
 				kind = "jump", takeoff = e.takeoff, land = e.pos,
 				dir = d.Magnitude > 0.01 and d.Unit or V3(0, 0, 1),
-				lip = (e.pos.Y - e.takeoff.Y) > CONFIG.StepUp, vault = e.vault, runup = e.runup, via = e.via, late = e.late, narrow = e.narrow,
+				lip = (e.pos.Y - e.takeoff.Y) > CONFIG.StepUp, vault = e.vault, runup = e.runup, via = e.via, late = e.late, narrow = e.narrow or e.ext, ext = e.ext, edgePt = e.edgePt,
 				inset = e.inset, face = (fz.Magnitude > 0.01) and fz.Unit or nil,
 				backout = e.backout, moveDir = (dvia.Magnitude > 0.01) and dvia.Unit or nil,
 			}
@@ -2064,10 +2136,21 @@ local function doJump(hum)
 	pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
 end
 
+-- sideways facing: the perpendicular of d that is closest to where we already look (shortest turn)
+local function sideDir(root, d)
+	local p = V3(-d.Z, 0, d.X)
+	if root.CFrame.LookVector:Dot(p) < 0 then p = -p end
+	return p
+end
+
 -- a jump failed: avoid that takeoff spot for a while; a failed LEDGE climb also lowers the lift estimate a bit
 local function jumpFailed(step, keepLift)
 	if not step or step.fall then return end
 	S.bad[#S.bad + 1] = { pos = step.takeoff, exp = os.clock() + 45 }
+	if step.ext then
+		S.extLearn = math.max(0, (S.extLearn or S.extend) - 0.3)
+		dbg(string.format("jump extender failed -> estimate lowered to %.2f", S.extLearn))
+	end
 	if not keepLift and step.lip and (S.liftBase or 0) > 0 then
 		S.liftPenalty = math.min((S.liftPenalty or 0) + 0.5, math.min(S.liftBase, 1.0))
 		dbg(string.format("ledge climb failed -> lift estimate lowered to %.2f", math.max(0, S.liftBase - S.liftPenalty)))
@@ -2414,7 +2497,7 @@ local function onStep(dt)
 		if not done then
 			if step.narrow and dist > 0.05 then
 				local pd = fl / dist
-				Face.target = V3(-pd.Z, 0, pd.X) -- face ACROSS the gap, slide through sideways
+				Face.target = sideDir(root, pd) -- face ACROSS the gap, slide through sideways
 			end
 			if dist <= 0.05 then
 				hum:Move(Vector3.zero, false)
@@ -2548,7 +2631,8 @@ local function onStep(dt)
 			end
 		elseif step.phase == "run" then
 			-- keep running at full speed, fire the jump WHILE moving
-			if CONFIG.FakeShiftlock then Face.target = step.narrow and V3(-step.dir.Z, 0, step.dir.X) or step.dir end
+			if CONFIG.FakeShiftlock then Face.target = step.narrow and sideDir(root, step.dir) or step.dir end
+			if grounded then step.wasG = true end
 			local toT = V3(T.X - feet.X, 0, T.Z - feet.Z)
 			local d = toT.Magnitude
 			local along = toT:Dot(step.dir)
@@ -2614,6 +2698,17 @@ local function onStep(dt)
 				end
 				doJump(hum)
 				step.phase, step.t0, step.left, step.tries = "air", os.clock(), false, 1
+			elseif not retreat and not grounded and step.wasG and not step.vault and not step.fall and os.clock() - step.t0 > 0.1 then
+				-- we left the ledge a little BEFORE the takeoff point: jump NOW (still inside the coyote window)
+				if step.ext and step.edgePt then
+					local beyond = (feet.X - step.edgePt.X) * step.dir.X + (feet.Z - step.edgePt.Z) * step.dir.Z
+					if beyond > 0.05 and beyond < 2 then
+						S.extLearn = math.clamp(0.5 * (S.extLearn or S.extend) + 0.5 * beyond, 0, S.halfW)
+						dbg(string.format("jump extender: left the ground %.2f past the edge (estimate now %.2f)", beyond, S.extLearn))
+					end
+				end
+				doJump(hum)
+				step.phase, step.t0, step.left, step.tries = "air", os.clock(), false, 1
 			elseif os.clock() - step.t0 > 8 then
 				replan(f, "run-up timeout") return
 			end
@@ -2639,7 +2734,7 @@ local function onStep(dt)
 				hum:Move(step.moveDir or step.dir, false)
 				if CONFIG.FakeShiftlock then
 					local f0 = step.face or step.dir
-					Face.target = step.narrow and V3(-f0.Z, 0, f0.X) or f0
+					Face.target = step.narrow and sideDir(root, f0) or f0
 				end
 				if elapsed > 0.35 then
 					if step.tries >= 3 then jumpFailed(step) replan(f, "jump failed") return end
@@ -2692,7 +2787,7 @@ local function onStep(dt)
 				if CONFIG.FakeShiftlock then
 					-- ledge jumps: keep FACING THE LEDGE while the movement direction stays free (strafe / walk backward)
 					local fd0 = (step.lip and step.face) or mv
-					Face.target = step.narrow and V3(-fd0.Z, 0, fd0.X) or fd0
+					Face.target = step.narrow and sideDir(root, fd0) or fd0
 				end
 				if CONFIG.VelocityAssist then
 					local v = mv * throttle * speed
@@ -3167,4 +3262,4 @@ refreshFilter()
 refreshButton()
 if player.Character then task.spawn(setupLearning, player.Character) end
 notify("Advanced Pathfinder by Spvico - tap AP to enable", WHITE)
-print("[Advanced Pathfinder] Created by Spvico (v1.3)")
+print("[Advanced Pathfinder] Created by Spvico (v1.5)")
