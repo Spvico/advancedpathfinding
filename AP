@@ -19,7 +19,7 @@
 
 	v1.3: LADDERS BY SHAPE. Names / tags / attributes are NOT used any more. A stack of >= 3 thin walkable bars one above
 	      another (gaps within this player's jump range) is a rung ladder; TrussPart is climbable by class. The climb
-	      pushes into the rungs while jumping (facing them with the fake shiftlock) and watches the height gain.
+	      walks into it like a truss (no jumping), facing it with the fake shiftlock, and watches the height gain.
 
 	v1.2 FIXES (roofs / overhangs)
 	  - HEADROOM: jump arcs are now swept with a HEAD sphere too, and ledge climbs no longer skip the first part of
@@ -1200,8 +1200,9 @@ end
 --     horizontally and the vertical gaps are within what THIS player can jump. Works for rung ladders attached to a wall
 --     and for free-standing ones. A prop that is merely called "Ladder" but has no such shape is ignored, and a wall of
 --     unnamed bars is found.
---   The rung climb is done like players do it: push into the rungs while jumping, facing them (fake shiftlock), and
---   WATCH the height. If we are not gaining height the stack is marked bad for a while and we re-plan.
+--   A ladder climbs like a truss: we walk INTO it and hold the move direction toward it (that is "up"), facing it with
+--   the fake shiftlock. We WATCH the height: if we are not gaining height the ladder is marked bad for a while and we
+--   re-plan (the rungs are still normal ledges, so the jump planner can use them instead).
 local expandClimbs
 do --[[blk]]
 local function rungLike(part)
@@ -2490,10 +2491,8 @@ local function onStep(dt)
 			end
 			hum:Move(mv, false)
 			if custom then
-				if step.up and feet.Y < step.topY - 1.2 and os.clock() - (step.lastJump or 0) > 0.3 then
-					hum.Jump = true -- custom ladders often need jumps to latch / push upward
-					step.lastJump = os.clock()
-				end
+				-- shape-detected ladder: it climbs like a truss, we just keep walking INTO it (move direction toward the
+				-- ladder = up). No jumping. Only watch the height so a ladder that doesn't work gets dropped.
 				local pnow = step.up and feet.Y or -feet.Y
 				if pnow > (step.bestP or pnow) + 0.15 then step.bestP, step.lastGain = pnow, os.clock() end
 			end
