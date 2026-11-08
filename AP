@@ -1271,6 +1271,7 @@ local function stackOf(part)
 	local st = {
 		base = levels[lo].items[1].part, topY = levels[hi].y, botY = levels[lo].y,
 		cx = sx / n, cz = sz / n, hw = hw + 0.3, n = n, topPos = top.face.center,
+		baseCenter = levels[lo].items[1].face.center,
 	}
 	for i = lo, hi do
 		for _, it in ipairs(levels[i].items) do S.rungs[it.part] = st end
@@ -1292,6 +1293,28 @@ local function objBox(obj)
 		return nil
 	end
 	return obj.CFrame, obj.Size
+end
+
+-- A rung ladder is only usable from where we can SEE and WALK to its rungs. Without this, a ladder on the far side of a
+-- thick wall counted as "close" and the planner tried to climb the wall itself.
+local function rungAccess(P, st)
+	-- 1. line of sight from body height to the lowest rung: the first thing hit must be a rung of this stack
+	local from = P + V3(0, MID_H, 0)
+	local d = st.baseCenter - from
+	local len = d.Magnitude
+	if len > 0.5 then
+		local res = raycast(from, d * (1 + 0.6 / len))
+		if res and S.rungs[res.Instance] ~= st and res.Distance < len - 0.7 then return false end
+	end
+	-- 2. a straight, walkable approach up to the rungs
+	local hx, hz = st.cx - P.X, st.cz - P.Z
+	local hl = math.sqrt(hx * hx + hz * hz)
+	if hl > st.hw + 1.0 then
+		local k = (hl - st.hw - 0.8) / hl
+		local A = V3(P.X + hx * k, P.Y, P.Z + hz * k)
+		if not pathClear(P, A, RADIUS) or not floorLine(P, A) then return false end
+	end
+	return true
 end
 
 expandClimbs = function(node, out)
@@ -1322,7 +1345,7 @@ expandClimbs = function(node, out)
 				local topY, botY = c.Y + ext, c.Y - ext
 				local hw = math.max(size.X, size.Z) * 0.5
 				local okShape = (kind == "truss" and math.abs(cf.UpVector.Y) >= 0.8) or kind == "rung"
-				if okShape and flatDist(P, c) - hw <= 3.2 then
+				if okShape and flatDist(P, c) - hw <= 3.2 and (kind ~= "rung" or rungAccess(P, st)) then
 					for _, up in ipairs(kind == "rung" and { true } or { true, false }) do
 						local can = (up and (P.Y <= botY + 4 and topY - P.Y >= 3))
 							or (not up and (P.Y >= topY - 4 and P.Y - botY >= 3))
@@ -2475,7 +2498,7 @@ local function onStep(dt)
 				step.phase, step.t0 = "climb", os.clock()
 				step.bestP = step.up and feet.Y or -feet.Y
 				step.lastGain = os.clock()
-			elseif elapsed > 4 then
+			elseif elapsed > (custom and 2.5 or 4) then
 				if custom then badLadders[truss] = os.clock() + 90 end
 				replan(f, "couldn't reach ladder") return
 			end
