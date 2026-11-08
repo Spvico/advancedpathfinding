@@ -1,5 +1,5 @@
 --[[
-	ADVANCED PATHFINDER v1.2
+	ADVANCED PATHFINDER v1.3
 	Created by Spvico
 
 	Custom A* pathfinder (NO PathfindingService) with physics-aware obby jumping.
@@ -16,6 +16,10 @@
 	  - run-up never stops: Move() stays active, jump is fired while still running
 	  - in the air, throttle is recomputed EVERY FRAME from (distance left / time left)
 	    so you touch down exactly on the landing point without braking before the jump
+
+	v1.3: LADDERS BY SHAPE. Names / tags / attributes are NOT used any more. A stack of >= 3 thin walkable bars one above
+	      another (gaps within this player's jump range) is a rung ladder; TrussPart is climbable by class. The climb
+	      pushes into the rungs while jumping (facing them with the fake shiftlock) and watches the height gain.
 
 	v1.2 FIXES (roofs / overhangs)
 	  - HEADROOM: jump arcs are now swept with a HEAD sphere too, and ledge climbs no longer skip the first part of
@@ -187,7 +191,7 @@ local hazRejects = 0
 local lastHazardPart = nil
 local S = {
 	g = 196.2, vy = 50, vyReal = 50, speed = 16, rootH = 3, maxH = 6.4, iceAccel = 10, bodyL = 1.9, bodyF = 0.7,
-	rootHalf = 1, liftBase = 1.6, lift = 1.6, liftPenalty = 0, headUp = 2.4, bad = {}, slideN = 0,
+	rootHalf = 1, liftBase = 1.6, lift = 1.6, liftPenalty = 0, headUp = 2.4, bad = {}, slideN = 0, rungs = {},
 }
 local CANCEL = {}
 
@@ -1190,38 +1194,93 @@ local function expandJumps(node, out, climbOnly)
 	end
 end
 
--- Ladders / climbables:
---   * TrussPart (collidable or not)
---   * CUSTOM ladders: a part or model (up to 3 parents up) named / tagged / attributed "ladder", "climb", "vine".
---     We don't know how those are scripted, so we push into them and keep jumping, and WATCH the height: if we
---     are not gaining height they are marked bad for a while and we re-plan (rung ladders are also reachable
---     through the normal jump logic, custom climbs cost more so real jump paths win).
+-- Ladders / climbables, detected by SHAPE only (names, tags and attributes are never used):
+--   * TrussPart: the engine climbs those itself (Climbing state), so the class IS the shape.
+--   * RUNG STACK: >= 3 thin walkable blocks (bars / steps / ledges) stacked one above another: their top faces overlap
+--     horizontally and the vertical gaps are within what THIS player can jump. Works for rung ladders attached to a wall
+--     and for free-standing ones. A prop that is merely called "Ladder" but has no such shape is ignored, and a wall of
+--     unnamed bars is found.
+--   The rung climb is done like players do it: push into the rungs while jumping, facing them (fake shiftlock), and
+--   WATCH the height. If we are not gaining height the stack is marked bad for a while and we re-plan.
 local expandClimbs
 do --[[blk]]
-local LADDER_WORDS = { "ladder", "climb", "vine" }
-local function ladderWord(str)
-	str = string.lower(str)
-	for _, w in ipairs(LADDER_WORDS) do
-		if string.find(str, w, 1, true) then return true end
+local function rungLike(part)
+	if part.ClassName == "Terrain" or not part:IsA("BasePart") or not part.CanCollide then return nil end
+	local face = topFace(part)
+	if not face or face.thick > 3.2 then return nil end
+	local w, mn = math.max(face.hu, face.hv) * 2, math.min(face.hu, face.hv) * 2
+	if w > 12 or mn < 0.35 then return nil end
+	return face
+end
+
+local function stackOf(part)
+	local cached = S.rungs[part]
+	if cached ~= nil then return cached or nil end
+	S.rungs[part] = false
+	local f0 = rungLike(part)
+	if not f0 or hazardPart(part) then return nil end
+	local c0 = f0.center
+	local reachXZ = math.max(f0.hu, f0.hv) + 1.3
+	local side = math.max(f0.hu, f0.hv) * 2 + 3
+	local maxGap = math.min(S.maxH + S.lift - 0.8, 5.5)
+	local items = {}
+	for _, q in ipairs(Workspace:GetPartBoundsInBox(CFrame.new(c0), V3(side, 140, side), overlapParams)) do
+		local fq = (q == part) and f0 or rungLike(q)
+		if fq and (q == part or not hazardPart(q)) and flatDist(fq.center, c0) <= reachXZ then
+			items[#items + 1] = { part = q, face = fq, y = fq.center.Y }
+		end
 	end
-	return false
+	table.sort(items, function(a, b) return a.y < b.y end)
+	-- parts at the same height form one level
+	local levels = {}
+	for _, it in ipairs(items) do
+		local lv = levels[#levels]
+		if lv and it.y - lv.y < 0.5 then
+			lv.items[#lv.items + 1] = it
+		else
+			levels[#levels + 1] = { y = it.y, items = { it } }
+		end
+	end
+	local li
+	for i, lv in ipairs(levels) do
+		for _, it in ipairs(lv.items) do
+			if it.part == part then li = i end
+		end
+	end
+	if not li then return nil end
+	local lo, hi = li, li
+	while lo > 1 do
+		local gap = levels[lo].y - levels[lo - 1].y
+		if gap >= 1.0 and gap <= maxGap then lo -= 1 else break end
+	end
+	while hi < #levels do
+		local gap = levels[hi + 1].y - levels[hi].y
+		if gap >= 1.0 and gap <= maxGap then hi += 1 else break end
+	end
+	local n = hi - lo + 1
+	if n < 3 then return nil end
+	local sx, sz, hw = 0, 0, 0
+	for i = lo, hi do
+		local it = levels[i].items[1]
+		sx += it.face.center.X
+		sz += it.face.center.Z
+		hw = math.max(hw, it.face.hu, it.face.hv)
+	end
+	local top = levels[hi].items[1]
+	local st = {
+		base = levels[lo].items[1].part, topY = levels[hi].y, botY = levels[lo].y,
+		cx = sx / n, cz = sz / n, hw = hw + 0.3, n = n, topPos = top.face.center,
+	}
+	for i = lo, hi do
+		for _, it in ipairs(levels[i].items) do S.rungs[it.part] = st end
+	end
+	return st
 end
 
 local function ladderOf(part)
 	if part.ClassName == "TrussPart" then return part, "truss" end
-	local inst, depth = part, 0
-	while inst and inst ~= Workspace and depth < 4 do
-		if inst:IsA("Model") or inst:IsA("BasePart") then
-			if ladderWord(inst.Name) then return inst, "custom" end
-			for _, tag in ipairs(CollectionService:GetTags(inst)) do
-				if ladderWord(tag) then return inst, "custom" end
-			end
-			for k, v in pairs(inst:GetAttributes()) do
-				if ladderWord(k) and v then return inst, "custom" end
-			end
-		end
-		inst, depth = inst.Parent, depth + 1
-	end
+	local st = stackOf(part)
+	if st then return st.base, "rung", st end
 	return nil
 end
 
@@ -1242,23 +1301,28 @@ expandClimbs = function(node, out)
 	if climbSeen[ck] and not node.landing then return end
 	climbSeen[ck] = true
 	climbChecks += 1
-	local parts = Workspace:GetPartBoundsInRadius(P, 5, hazardOverlap) -- also sees non-collidable ladders
+	local parts = Workspace:GetPartBoundsInRadius(P, 5, hazardOverlap) -- also sees non-collidable trusses
 	local seen = {}
 	for _, part in ipairs(parts) do
-		local obj, kind = ladderOf(part)
+		local obj, kind, st = ladderOf(part)
 		if obj and not seen[obj] and (badLadders[obj] or 0) < os.clock() then
 			seen[obj] = true
-			local cf, size = objBox(obj)
+			local cf, size
+			if kind == "rung" then
+				cf = CFrame.new(st.cx, (st.topY + st.botY) / 2, st.cz)
+				size = V3(st.hw * 2, math.max(st.topY - st.botY, 0.1), st.hw * 2)
+			else
+				cf, size = objBox(obj)
+			end
 			if cf then
 				local ext = 0.5 * (size.Y * math.abs(cf.UpVector.Y)
 					+ size.X * math.abs(cf.RightVector.Y) + size.Z * math.abs(cf.LookVector.Y))
 				local c = cf.Position
 				local topY, botY = c.Y + ext, c.Y - ext
 				local hw = math.max(size.X, size.Z) * 0.5
-				local okShape = (kind == "truss" and math.abs(cf.UpVector.Y) >= 0.8)
-					or (kind == "custom" and topY - botY >= 5 and hw <= 7)
+				local okShape = (kind == "truss" and math.abs(cf.UpVector.Y) >= 0.8) or kind == "rung"
 				if okShape and flatDist(P, c) - hw <= 3.2 then
-					for _, up in ipairs({ true, false }) do
+					for _, up in ipairs(kind == "rung" and { true } or { true, false }) do
 						local can = (up and (P.Y <= botY + 4 and topY - P.Y >= 3))
 							or (not up and (P.Y >= topY - 4 and P.Y - botY >= 3))
 						if can then
@@ -1278,12 +1342,21 @@ expandClimbs = function(node, out)
 									end
 								end
 							end
+							if kind == "rung" and up then
+								-- the top rung itself is always a valid place to end the climb
+								local tp = st.topPos
+								local r = raycast(V3(tp.X, st.topY + 1.5, tp.Z), V3(0, -3, 0))
+								if r and r.Normal.Y >= COS_LAND and not isHazardHit(r) then
+									local sc = (r.Position - goalPos).Magnitude
+									if not best or sc < best.sc then best = { r = r, sc = sc } end
+								end
+							end
 							if best then
 								local E = best.r.Position
-								local custom = kind == "custom"
+								local custom = kind == "rung"
 								out[#out + 1] = {
 									kind = "climb", pos = E, inst = best.r.Instance, truss = obj,
-									topY = topY, botY = botY, up = up, from = P,
+									topY = topY, botY = botY, up = up, from = P, cpos = c,
 									custom = custom, reach = hw + 1.8,
 									cost = math.abs(E.Y - P.Y) * (custom and 1.6 or 0.8) + flatDist(P, E) + (custom and 8 or 3),
 								}
@@ -1730,6 +1803,7 @@ local function findPath(startPos, startInst, goal, weight)
 	fallExpansions = 0
 	vaultExpansions = 0
 	S.slideN = 0
+	S.rungs = {}
 
 	local function getNode(pos, inst)
 		local k = keyOf(pos)
@@ -1842,10 +1916,10 @@ local function buildSteps(endNode, goal, complete, startPos)
 	for i = 2, #chain do
 		local e = chain[i].edge
 		if e.kind == "climb" then
-			local fd = flat(objPos(e.truss) - e.from)
+			local fd = flat((e.cpos or objPos(e.truss)) - e.from)
 			steps[#steps + 1] = {
 				kind = "climb", truss = e.truss, exit = e.pos, topY = e.topY, botY = e.botY, up = e.up,
-				custom = e.custom, reach = e.reach,
+				custom = e.custom, reach = e.reach, cpos = e.cpos,
 				dir = fd.Magnitude > 0.01 and fd.Unit or V3(0, 0, 1),
 			}
 		elseif e.kind == "jump" then
@@ -2385,13 +2459,14 @@ local function onStep(dt)
 		local truss, E = step.truss, step.exit
 		if not truss or not truss.Parent then replan(f, "ladder gone") return end
 		if not step.phase then step.phase, step.t0 = "approach", os.clock() end
-		local tc = objPos(truss)
+		local tc = step.cpos or objPos(truss)
 		local into = V3(tc.X - feet.X, 0, tc.Z - feet.Z)
 		local il = into.Magnitude
 		local intoDir = (il > 0.05) and into / il or step.dir
 		local climbing = hum:GetState() == Enum.HumanoidStateType.Climbing
 		local elapsed = os.clock() - step.t0
 		local custom = step.custom
+		if CONFIG.FakeShiftlock and custom then Face.target = intoDir end -- face the rungs while pushing in / climbing
 
 		if step.phase == "approach" then
 			hum:Move(intoDir, false) -- walk into it; a truss grabs us on contact
@@ -3070,4 +3145,4 @@ refreshFilter()
 refreshButton()
 if player.Character then task.spawn(setupLearning, player.Character) end
 notify("Advanced Pathfinder by Spvico - tap AP to enable", WHITE)
-print("[Advanced Pathfinder] Created by Spvico (v1.2)")
+print("[Advanced Pathfinder] Created by Spvico (v1.3)")
